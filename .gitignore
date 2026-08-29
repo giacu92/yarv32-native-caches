@@ -1,0 +1,11 @@
+# Verilator build artefacts
+sim/obj_dir/
+sim/*.vcd
+
+# Gowin IDE / gw_sh output
+*.fs
+*.prj
+*.gprj
+impl*/
+temp/
+.claude/

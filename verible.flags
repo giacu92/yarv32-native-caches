@@ -1,0 +1,23 @@
+# Verible SystemVerilog formatter configuration for this project.
+#
+# Passed to verible-verilog-format via `--flagfile=verible.flags` from
+# the top-level Makefile. These flags capture the style the RTL already
+# follows: 4-space indentation, 100-column limit, aligned port /
+# parameter / named-connection / assignment groups, and `end else` kept
+# on one line (matching the existing `end else begin` idiom).
+#
+# Edit this file to change the project-wide formatting policy; do NOT
+# pass overriding flags on the Makefile command line or the two will
+# drift apart.
+
+--indentation_spaces=4
+--column_limit=100
+--try_wrap_long_lines=true
+--wrap_end_else_clauses=false
+
+# Align repeated declarations / connections / assignments into columns
+# (matches the existing hand-aligned port and always-block style).
+--port_declarations_alignment=align
+--named_port_alignment=align
+--named_parameter_alignment=align
+--assignment_statement_alignment=align

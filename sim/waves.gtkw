@@ -1,0 +1,31 @@
+[*]
+[*] GTKWave Analyzer v3.3.126 (w)1999-2026 BSI
+[*] Sat Aug 29 06:44:15 2026
+[*]
+[dumpfile] "/home/giacomo/gowin_proj/yarv-native-cache/sim/sim_top.vcd"
+[dumpfile_mtime] "Sat Aug 29 06:44:13 2026"
+[dumpfile_size] 53377
+[savefile] "/home/giacomo/gowin_proj/yarv-native-cache/sim/waves.gtkw"
+[timestart] 0
+[size] 1920 1105
+[pos] -27 -24
+*-14.849297 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+[treeopen] sim_top.
+[sst_width] 297
+[signals_width] 206
+[sst_expanded] 1
+[sst_vpaned_height] 333
+@200
+-Read Req - IMEM
+@28
+sim_top.u_dut.icache_req_valid
+@22
+sim_top.u_dut.icache_req_addr[63:0]
+@28
+sim_top.u_dut.icache_req_rready
+sim_top.u_dut.icache_req_we
+@22
+sim_top.u_dut.icache_req_wdata[63:0]
+sim_top.u_dut.icache_req_wstrb[7:0]
+[pattern_trace] 1
+[pattern_trace] 0
