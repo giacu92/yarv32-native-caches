@@ -2,6 +2,8 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
+import yarv32_cache_pkg::*;
+
 /**
  * Behavioral replacement for the Gowin SDRAM HS IP `SDRAM_Controller_HS_Top`.
  *
@@ -20,11 +22,12 @@
  *   - O_sdrc_cmd_ack is asserted combinationally, coincident with
  *     I_sdrc_cmd_en, so the FSM's S_*_REQ state sees the handshake the same
  *     cycle and advances on the next edge.
- *   - Read  (I_sdrc_cmd == 3'b010): after the ack, stream I_sdrc_data_len
- *     consecutive 32-bit words from memory onto O_sdrc_data, one per cycle,
- *     starting the cycle after the ack — matching S_REFILL_WAIT, which
- *     samples O_sdrc_data every cycle for BURST_LEN words.
- *   - Write (I_sdrc_cmd == 3'b001): capture I_sdrc_data into memory for
+ *   - Read  (I_sdrc_cmd == SDRC_CMD_READ): after the ack, stream
+ *     I_sdrc_data_len consecutive 32-bit words from memory onto
+ *     O_sdrc_data, one per cycle, starting the cycle after the ack —
+ *     matching S_REFILL_WAIT, which samples O_sdrc_data every cycle for
+ *     BURST_LEN words.
+ *   - Write (I_sdrc_cmd == SDRC_CMD_WRITE): capture I_sdrc_data into memory for
  *     I_sdrc_data_len consecutive words, one per cycle, with word[0]
  *     captured at the ack cycle itself (the FSM drives sdrc_data from the
  *     ack cycle onward, so the stub must grab the first word at launch, not
@@ -67,10 +70,13 @@ module SDRAM_Controller_HS_Top (
 );
 
     // -----------------------------------------------------------------
-    // Command encoding (matches the placeholder values the FSM uses).
+    // Command encoding: the shared SDRC_CMD_* localparams from
+    // yarv32_cache_pkg — the same ones cache_cntrl's FSM drives — so a
+    // re-encoding of either side is a compile error, not a silent mismatch.
+    // (Values are placeholders until confirmed against the Gowin HS IP
+    // docs, so this sim still cannot catch a wrong value against real
+    // hardware — TODO.md Phase 5.)
     // -----------------------------------------------------------------
-    localparam logic [2:0] CMD_WRITE = 3'b001;
-    localparam logic [2:0] CMD_READ = 3'b010;
 
     // -----------------------------------------------------------------
     // Backing store: 2^21 x 32-bit words = 8 MiB. Preloaded with a
@@ -147,15 +153,15 @@ module SDRAM_Controller_HS_Top (
                     if (I_sdrc_cmd_en) begin
                         addr_q     <= I_sdrc_addr;
                         len_q      <= I_sdrc_data_len;
-                        is_write_q <= (I_sdrc_cmd == CMD_WRITE);
+                        is_write_q <= (I_sdrc_cmd == SDRC_CMD_WRITE);
                         // Writes capture word[0] at this (ack) edge below, so
                         // ST_RUN resumes at index 1. Reads present word[0]
                         // combinationally in ST_RUN, so they start at 0.
-                        cnt_q      <= (I_sdrc_cmd == CMD_WRITE) ? 8'd1 : 8'd0;
+                        cnt_q      <= (I_sdrc_cmd == SDRC_CMD_WRITE) ? 8'd1 : 8'd0;
                         st_q       <= ST_RUN;
                         // The FSM drives the write data from this very
                         // (ack) cycle; capture word[0] now to stay aligned.
-                        if (I_sdrc_cmd == CMD_WRITE) begin
+                        if (I_sdrc_cmd == SDRC_CMD_WRITE) begin
                             mem[I_sdrc_addr] <= I_sdrc_data;
                         end
                     end

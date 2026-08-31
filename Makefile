@@ -92,10 +92,13 @@ wave: sim
 # `%:` rule, so unknown/typo targets fail at the root with a clear "No
 # rule to make target" instead of being silently forwarded into sim/).
 #
+# sim/cosim and sim/sw trees do not exist yet (TODO.md Phase 7); guard the
+# delegations with $(wildcard) so `make clean` works without them.
+COSIM_CLEAN := $(patsubst %/Makefile,%,$(wildcard sim/cosim/*/Makefile))
+
 clean:
 	$(MAKE) -C sim clean
-	$(MAKE) -C sim/cosim/quicksort clean
-	$(MAKE) -C sim/cosim/ecall clean
+	@for d in $(COSIM_CLEAN); do $(MAKE) -C $$d clean || exit 1; done
 
 run:
 	$(MAKE) -C sim run

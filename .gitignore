@@ -9,3 +9,7 @@ sim/*.vcd
 impl*/
 temp/
 .claude/
+
+# Hash-analysis leftovers (hash dropped from RTL; env is machine-local)
+sim/hashing/cache_hash_env/
+sim/hashing/*.png

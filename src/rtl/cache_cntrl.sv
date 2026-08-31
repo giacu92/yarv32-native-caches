@@ -8,11 +8,9 @@ import yarv32_cache_pkg::*;
  * Cache line size: 32 byte
  * I-Cache size: 8 KiB - D-Cache size: 8 KiB = 16 KiB total
  * 8 MiB SDRAM (GW2AR Internal) --> Address is 23 bit wide
- *
- * HASH_INDEX = 0 : classic bit-slice set index
- *                  addr = {tag, set_idx, offset}
- * HASH_INDEX = 1 : hashed set index (cache_set_hash in yarv32_cache_pkg)
- *                  tag stores the full block address (no false hits)
+ * addr = {tag, set_idx, offset} (classic bit-slice set index)
+ * CPU access width is 64 bit (doubleword select, addr[NBIT_OFFSET-1:3])
+ * I-mem port: read-only, up to 2 outstanding reads (fetch instruction buffer)
  *
  * Naming: ports use *_i/_o; internals no prefix; flops _q.
  */
@@ -25,9 +23,7 @@ module cache_cntrl #(
     // Number of way (caches are set-associative)
     parameter int N_WAY = 2,
     // Cache width in bits (depth = 2^CACHE_SIZE bytes). Both have same size
-    parameter int CACHE_SIZE = 13,  // 2^13 = 8 KiB
-    // 0 = classic index, 1 = hashed index (see cache_set_hash in package)
-    parameter bit HASH_INDEX = 1'b1
+    parameter int CACHE_SIZE = 13  // 2^13 = 8 KiB
 ) (
     input wire clk_i,
     input wire rstn_i,
@@ -69,11 +65,8 @@ module cache_cntrl #(
     // NBIT_SET_IDX: 128 sets --> 7 bit
     localparam int NBIT_SET_IDX = $clog2(N_SETS);
 
-    // Classic: leftover high bits after {set, offset} + valid + dirty
-    // Hashed : full block address (addr without offset) + valid + dirty
-    //          because the set index is no longer a bit-slice of the address
-    localparam int NBIT_TAG = HASH_INDEX ?
-        ((MEM_SIZE - NBIT_OFFSET) + 2) : ((MEM_SIZE - NBIT_SET_IDX - NBIT_OFFSET) + 2);
+    // {tag, set, offset} split + valid + dirty
+    localparam int NBIT_TAG = MEM_SIZE - NBIT_SET_IDX - NBIT_OFFSET + 2;
 
     // TAG_DATA_W: Round up to the next multiple of 8 (byte-aligned)
     localparam int TAG_DATA_W = ((NBIT_TAG + 7) / 8) * 8;
@@ -101,6 +94,14 @@ module cache_cntrl #(
     // alias to the same tag word.
     localparam int TAG_BYTES_W = $clog2(TAG_DATA_W / 8);
 
+    // Tag macro address width: NBIT_SET_IDX word-select bits + TAG_BYTES_W
+    // intra-word byte-select bits, so the macro stores one tag word per set
+    // (native_ram decodes word_addr = addr[TAG_ADDR_W-1:TAG_BYTES_W] =
+    // set_idx). An ADDR_W of NBIT_SET_IDX alone would drop the byte-select
+    // bits out of set_idx and alias sets 2**TAG_BYTES_W apart onto one tag
+    // word (false hits / clobbered tags).
+    localparam int TAG_ADDR_W = NBIT_SET_IDX + TAG_BYTES_W;
+
     // Per-instance protocol types, re-expanded from the package macros at
     // this module's own geometry (the package mem_req_t/cache_req_t are
     // the fixed-width instances of the same macros). way_*_t is one whole
@@ -110,6 +111,21 @@ module cache_cntrl #(
     `YARV_MEM_TYPES(way_req_t, way_rsp_t, MEM_WIDTH, DATA_WIDTH)
     `YARV_MEM_TYPES(tag_req_t, tag_rsp_t, MEM_WIDTH, TAG_DATA_W)
 
+`ifdef VERILATOR
+    // Elaboration-time geometry check: the tag macros must have one word
+    // per set (see TAG_ADDR_W above).
+    initial begin
+        assert ((1 << (TAG_ADDR_W - TAG_BYTES_W)) >= N_SETS)
+        else
+            $fatal(
+                1,
+                "tag macro word depth (%0d) < N_SETS (%0d)",
+                1 << (TAG_ADDR_W - TAG_BYTES_W),
+                N_SETS
+            );
+    end
+`endif
+
     // ===================================================================
     // Signal declarations
     // ===================================================================
@@ -118,9 +134,9 @@ module cache_cntrl #(
     mem_rsp_t bootr_rsp;  // from bootrom
 
     way_req_t imem_req[N_WAY];  // towards icache ways
-    way_rsp_t imem_rsp_d[N_WAY], imem_rsp_q[N_WAY];  // from icache ways
+    way_rsp_t imem_rsp_d[N_WAY];  // from icache ways
     way_req_t dmem_req[N_WAY];  // towards dcache ways
-    way_rsp_t dmem_rsp_d[N_WAY], dmem_rsp_q[N_WAY];  // from dcache ways
+    way_rsp_t dmem_rsp_d[N_WAY];  // from dcache ways
 
     tag_req_t itag_req[N_WAY];  // towards itag ways
     tag_rsp_t itag_rsp[N_WAY];  // from itag ways
@@ -143,20 +159,122 @@ module cache_cntrl #(
     logic sdrc_init_done;
     logic sdrc_cmd_ack;
 
-    // Per-cache address split. Indexed by CACHE, not by way: set_idx/tag are
-    // broadcast to all N_WAY ways of a cache, so there is nothing per-way to
-    // compute here. 0 = icache, 1 = dcache.
+    // Per-cache request skid, slot-indexed (freed slots are reused as a
+    // free list; at most one slot is ever un-launched, so launch order =
+    // accept order and responses stay in order). A CPU request is accepted
+    // into a free slot at the launch handshake; the address split, the
+    // tag/data macro lookups, and the tag compare all run off the
+    // REGISTERED request, so the 1-cycle-old tag RAM output is compared
+    // against the address that launched the lookup — no stale-tag race when
+    // the CPU changes the address after accept. Indexed by CACHE, not by
+    // way: set_idx/tag are broadcast to all N_WAY ways of a cache.
+    // 0 = icache, 1 = dcache.
     localparam int N_CACHE = 2;
+    localparam int N_SLOT = 2;
 
+    // Outstanding-request limit per cache: 2 for the read-only I-port (the
+    // fetch unit's 2 in-flight reads), 1 for the D-port (single-outstanding).
+    localparam int SKID_DEPTH[N_CACHE] = '{2, 1};
+
+    mem_req_t skid_q[N_CACHE][N_SLOT];  // accepted requests (skid slots)
+    logic skid_valid_q[N_CACHE][N_SLOT];  // slot occupied
+    logic slot_lookup_q[N_CACHE][N_SLOT];  // lookup launched for this slot
+    logic slot_rsp_q[N_CACHE][N_SLOT];  // this slot's tag answer arrives now
+    logic miss_seen_q[N_CACHE][N_SLOT];  // slot missed; waiting for FSM pickup
+    logic [N_SLOT-1:0] slot_miss_q[N_CACHE];  // slot's miss taken by the FSM:
+    // blocks younger queue entries until the miss completes (TODO Phase 4)
+
+    // Response queue (per cache): captured hit data, delivered to the CPU in
+    // accept order. rvalid is a LEVEL held until rready pops the head —
+    // protocol compliance, not a one-cycle lookup pulse.
+    logic [MEM_WIDTH-1:0] rq_q[N_CACHE][N_SLOT];  // rq_q[c][0] is the head
+    logic rq_blk_q[N_CACHE][N_SLOT];  // entry waits behind an older miss
+    logic [1:0] rq_cnt_q[N_CACHE];  // entries in the queue (0..2)
+
+    // Lookup compare context, registered at lookup launch. With back-to-back
+    // I-port lookups the address split has already moved on to the next slot
+    // when a tag answer arrives, so the compare runs against this registered
+    // copy, not the live split.
+    logic [N_CACHE-1:0][TAG_FIELD_W-1:0] cmp_tag_q;
+    logic [N_CACHE-1:0][$clog2(DATA_WIDTH/64)-1:0] cmp_dw_sel_q;
+    logic [N_CACHE-1:0] cmp_we_q;
+
+    // Slot selection (per cache, always_comb — Verilator's V3Delayed chokes
+    // on multiple calls of the same automatic function from a clocked
+    // block). At most one slot is ever un-launched, so "first matching
+    // slot" is unambiguous. The 0 defaults are unreachable whenever the
+    // corresponding strobe (accept / lookup_go / rsp pulse / fsm latch) is
+    // asserted.
+    int slot_free[N_CACHE];  // first free slot (skid full only if !wready)
+    int slot_lookup_sel[N_CACHE];  // slot to launch the lookup for
+    int slot_rsp_sel[N_CACHE];  // slot the tag answer belongs to
+    int slot_miss_sel[N_CACHE];  // oldest slot the FSM will pick up
+    logic slot_miss_wait[N_CACHE];  // a slot awaits FSM pickup
+    int slot_outstanding[N_CACHE];  // occupied slots + queue entries
+
+    always_comb begin
+        for (int c = 0; c < N_CACHE; c++) begin
+            if (!skid_valid_q[c][0]) slot_free[c] = 0;
+            else if (!skid_valid_q[c][1]) slot_free[c] = 1;
+            else slot_free[c] = 0;  // full: unreachable while wready=1
+
+            if (skid_valid_q[c][0] && !slot_lookup_q[c][0]) slot_lookup_sel[c] = 0;
+            else if (skid_valid_q[c][1] && !slot_lookup_q[c][1]) slot_lookup_sel[c] = 1;
+            else slot_lookup_sel[c] = 0;  // no pending lookup; content unused
+
+            if (slot_rsp_q[c][0]) slot_rsp_sel[c] = 0;
+            else if (slot_rsp_q[c][1]) slot_rsp_sel[c] = 1;
+            else slot_rsp_sel[c] = 0;
+
+            if (skid_valid_q[c][0] && miss_seen_q[c][0]) slot_miss_sel[c] = 0;
+            else if (skid_valid_q[c][1] && miss_seen_q[c][1]) slot_miss_sel[c] = 1;
+            else slot_miss_sel[c] = 0;
+
+            slot_miss_wait[c] = (skid_valid_q[c][0] && miss_seen_q[c][0]) ||
+                (skid_valid_q[c][1] && miss_seen_q[c][1]);
+
+            // Outstanding units: occupied skid slots plus unconsumed queue
+            // entries. Every accepted read stays exactly one unit until the
+            // CPU consumes it, so the queue can never overflow SKID_DEPTH.
+            slot_outstanding[c] = (skid_valid_q[c][0] ? 1 : 0) + (skid_valid_q[c][1] ? 1 : 0) +
+                32'(rq_cnt_q[c]);
+        end
+    end
+
+    // The address split runs off the skid slot being launched (see skid_q).
     mem_req_t cache_req[N_CACHE];
-    assign cache_req[0] = icache_req_i;
-    assign cache_req[1] = dcache_req_i;
+
+    always_comb begin
+        for (int c = 0; c < N_CACHE; c++) cache_req[c] = skid_q[c][slot_lookup_sel[c]];
+    end
+
+    // Lookup issue: exactly one tag+data macro lookup per accepted request
+    // (slot_lookup_q gates relaunch while the CPU holds rready=1).
+    logic cache_lookup_go[N_CACHE];
+
+    always_comb begin
+        for (int c = 0; c < N_CACHE; c++) begin
+            cache_lookup_go[c] = (skid_valid_q[c][0] && !slot_lookup_q[c][0]) ||
+                (skid_valid_q[c][1] && !slot_lookup_q[c][1]);
+        end
+    end
+
+    // One response pulse per lookup: itag_rsp/dtag_rsp rvalid are identical
+    // across ways (same broadcast lookup, same native_ram latency), so way 0
+    // is a valid representative.
+    logic cache_rsp_pulse[N_CACHE];
+    logic cache_hit_pulse[N_CACHE];
+    assign cache_rsp_pulse[0] = itag_rsp[0].rvalid;
+    assign cache_rsp_pulse[1] = dtag_rsp[0].rvalid;
+    assign cache_hit_pulse[0] = cache_rsp_pulse[0] && icache_hit;
+    assign cache_hit_pulse[1] = cache_rsp_pulse[1] && dcache_hit;
 
     logic [N_CACHE-1:0][NBIT_OFFSET-1:0] offset;
     logic [N_CACHE-1:0][NBIT_SET_IDX-1:0] set_idx;
     logic [N_CACHE-1:0][NBIT_TAG-3:0] tag;
-    // Word index within a line (32-bit granularity): 2**(CL_SIZE-2) words
-    logic [N_CACHE-1:0][$clog2(DATA_WIDTH/32)-1:0] mask;
+    // Doubleword index within a line (64-bit granularity):
+    // 2**(CL_SIZE-3) doublewords, selected by addr[NBIT_OFFSET-1:3]
+    logic [N_CACHE-1:0][$clog2(DATA_WIDTH/64)-1:0] dw_sel;
 
     // Tag RAM read decode (per way)
     logic [N_WAY-1:0] icache_valid;
@@ -192,7 +310,7 @@ module cache_cntrl #(
     // ICACHE / DCACHE / I-TAG / D-TAG: N_WAY parallel macros, one per way,
     // looked up in parallel on every request. Data macros are WAY_ADDR_W
     // wide (halved vs. a single direct-mapped macro at N_WAY=2); tag
-    // macros stay NBIT_SET_IDX wide (already per-set, unaffected by N_WAY).
+    // macros are TAG_ADDR_W wide (one tag word per set, see TAG_ADDR_W).
     genvar w;
     generate
         for (w = 0; w < N_WAY; w++) begin : gen_way
@@ -226,7 +344,7 @@ module cache_cntrl #(
             );
 
             native_ram #(
-                .ADDR_W    (NBIT_SET_IDX),
+                .ADDR_W    (TAG_ADDR_W),
                 .DATA_WIDTH(TAG_DATA_W),
                 .REQ_T     (tag_req_t),
                 .RSP_T     (tag_rsp_t),
@@ -240,7 +358,7 @@ module cache_cntrl #(
             );
 
             native_ram #(
-                .ADDR_W    (NBIT_SET_IDX),
+                .ADDR_W    (TAG_ADDR_W),
                 .DATA_WIDTH(TAG_DATA_W),
                 .REQ_T     (tag_req_t),
                 .RSP_T     (tag_rsp_t),
@@ -292,37 +410,23 @@ module cache_cntrl #(
     // Address split + tag RAM read wiring + hit comparison are in place.
     // Refill/write-back FSM still to be added.
 
-    // Address split per cache. generate-if so only one branch is elaborated:
-    // HASH_INDEX changes TAG_FIELD_W, and a runtime if would width-mismatch.
-    generate
-        if (HASH_INDEX) begin : g_hash_index
-            always_comb begin
-                for (int c = 0; c < N_CACHE; c++) begin
-                    offset[c]  = cache_req[c].addr[NBIT_OFFSET-1:0];
-                    set_idx[c] = cache_set_hash(cache_req[c].addr[MEM_SIZE-1:0]);
-                    tag[c]     = cache_req[c].addr[MEM_SIZE-1:NBIT_OFFSET];
-                    mask[c]    = offset[c][NBIT_OFFSET-1:2];
-                end
-            end
-        end else begin : g_classic_index
-            always_comb begin
-                for (int c = 0; c < N_CACHE; c++) begin
-                    offset[c]  = cache_req[c].addr[NBIT_OFFSET-1:0];
-                    set_idx[c] = cache_req[c].addr[NBIT_OFFSET+:NBIT_SET_IDX];
-                    tag[c]     = cache_req[c].addr[MEM_SIZE-1-:TAG_FIELD_W];
-                    mask[c]    = offset[c][NBIT_OFFSET-1:2];
-                end
-            end
+    // Address split per cache (classic bit-slice): addr = {tag, set, offset}.
+    always_comb begin
+        for (int c = 0; c < N_CACHE; c++) begin
+            offset[c]  = cache_req[c].addr[NBIT_OFFSET-1:0];
+            set_idx[c] = cache_req[c].addr[NBIT_OFFSET+:NBIT_SET_IDX];
+            tag[c]     = cache_req[c].addr[MEM_SIZE-1-:TAG_FIELD_W];
+            dw_sel[c]  = offset[c][NBIT_OFFSET-1:3];
         end
-    endgenerate
+    end
 
     // -------------------------------------------------------------
-    // Tag RAM read requests (lookup on every incoming request)
+    // Tag RAM read requests (one lookup per accepted request, from req_q)
     // -------------------------------------------------------------
     always_comb begin
         for (int i = 0; i < N_WAY; i++) begin
             itag_req[i] = '0;
-            itag_req[i].valid = icache_req_i.valid;
+            itag_req[i].valid = cache_lookup_go[0];
             itag_req[i].we = 1'b0;  // lookup only, tag write handled by refill FSM
             // set_idx shifted left by TAG_BYTES_W: native_ram drops the low
             // BYTES_W bits of addr as byte-select, not as part of the set
@@ -333,7 +437,7 @@ module cache_cntrl #(
             itag_req[i].rready = 1'b1;
 
             dtag_req[i] = '0;
-            dtag_req[i].valid = dcache_req_i.valid;
+            dtag_req[i].valid = cache_lookup_go[1];
             dtag_req[i].we = 1'b0;
             dtag_req[i].addr = {
                 {(MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}}, set_idx[1], {TAG_BYTES_W{1'b0}}
@@ -353,58 +457,185 @@ module cache_cntrl #(
             icache_dirty[i] = itag_rsp[i].rdata[1];
             icache_tag_stored[i] = itag_rsp[i].rdata[2+:TAG_FIELD_W];
             icache_way_hit[i] = itag_rsp[i].rvalid && icache_valid[i] &&
-                (icache_tag_stored[i] == tag[0]);
+                (icache_tag_stored[i] == cmp_tag_q[0]);
             icache_hit |= icache_way_hit[i];
 
             dcache_valid[i] = dtag_rsp[i].rdata[0];
             dcache_dirty[i] = dtag_rsp[i].rdata[1];
             dcache_tag_stored[i] = dtag_rsp[i].rdata[2+:TAG_FIELD_W];
             dcache_way_hit[i] = dtag_rsp[i].rvalid && dcache_valid[i] &&
-                (dcache_tag_stored[i] == tag[1]);
+                (dcache_tag_stored[i] == cmp_tag_q[1]);
             dcache_hit |= dcache_way_hit[i];
         end
     end
 
     // -------------------------------------------------------------
-    // ICACHE/DCACHE speculative read
-    // If hit, data is already available. If miss, discard read data
+    // ICACHE/DCACHE speculative read, launched with the tag lookup
+    // (one per accepted request). If hit, data is already available in the
+    // imem_rsp_q/dmem_rsp_q stage one cycle later. If miss, discard read
+    // data.
     // -------------------------------------------------------------
     always_comb begin
         for (int i = 0; i < N_WAY; i++) begin
             imem_req[i]        = '0;
-            imem_req[i].valid  = icache_req_i.valid;
+            imem_req[i].valid  = cache_lookup_go[0];
             imem_req[i].we     = 1'b0;  // lookup only, imem write handled by refill FSM
             imem_req[i].wstrb  = '0;  // lookup only, wstrb muxing for hits is TODO
-            imem_req[i].addr   = icache_req_i.addr;
+            imem_req[i].addr   = cache_req[0].addr;
             imem_req[i].rready = 1'b1;
 
             dmem_req[i]        = '0;
-            dmem_req[i].valid  = dcache_req_i.valid;
+            dmem_req[i].valid  = cache_lookup_go[1];
             dmem_req[i].we     = 1'b0;  // lookup only, dmem write handled by refill FSM
             dmem_req[i].wstrb  = '0;  // lookup only, wstrb muxing for hits is TODO
-            dmem_req[i].addr   = dcache_req_i.addr;
+            dmem_req[i].addr   = cache_req[1].addr;
             dmem_req[i].rready = 1'b1;
         end
     end
 
-    // Registered hit-way / word-select, aligned with imem_rsp_q/dmem_rsp_q
-    // (one cycle after the RAM outputs, same stage as the line data).
-    logic [N_WAY-1:0] icache_way_hit_q, dcache_way_hit_q;
-    logic [$clog2(DATA_WIDTH/32)-1:0] icache_word_sel_q, dcache_word_sel_q;
+    // -------------------------------------------------------------
+    // Hit-way line mux over the RAW data-macro outputs. A response is
+    // captured into the queue at the tag-answer cycle (the same cycle the
+    // lookup pulse fires), one stage earlier than the old imem_rsp_q path.
+    // -------------------------------------------------------------
+    logic [DATA_WIDTH-1:0] icache_line, dcache_line;
+
+    always_comb begin
+        icache_line = '0;
+        dcache_line = '0;
+        for (int i = 0; i < N_WAY; i++) begin
+            if (icache_way_hit[i]) icache_line = imem_rsp_d[i].rdata;
+            if (dcache_way_hit[i]) dcache_line = dmem_rsp_d[i].rdata;
+        end
+    end
+
+    // 64-bit doubleword selected out of the hit line (cmp_dw_sel_q is the
+    // launch-registered copy of addr[NBIT_OFFSET-1:3]).
+    logic [MEM_WIDTH-1:0] icache_push_data, dcache_push_data;
+    assign icache_push_data = icache_line[cmp_dw_sel_q[0]*64+:64];
+    assign dcache_push_data = dcache_line[cmp_dw_sel_q[1]*64+:64];
+
+    // -------------------------------------------------------------
+    // Skid + response queue state (per cache):
+    //   accept    : raw CPU request latched into the first free slot
+    //   lookup_go : launches the one tag+data lookup for that slot and
+    //               registers the compare context (cmp_tag_q/cmp_dw_sel_q/
+    //               cmp_we_q) off the launching slot's split
+    //   rsp pulse : the lookup's tag answer. A hit frees the slot; a load
+    //               hit also pushes {rdata, blk} onto the response queue.
+    //               A store hit is a posted store — no response (the
+    //               data-macro write is TODO Phase 4). A miss flags
+    //               miss_seen_q for the FSM and keeps the slot occupied so
+    //               no younger response can pass an older miss.
+    //   pop       : the CPU consumed the queue head (rready)
+    //   fsm_latch : the miss FSM took the slot over: miss_seen_q clears,
+    //               slot_miss_q sets. slot_miss_q stays set (blocking
+    //               younger entries) until the miss completes and the
+    //               requester is unstalled (TODO Phase 4); the slot counts
+    //               as outstanding the whole time, so wready stays low on
+    //               the single-outstanding D-port.
+    // -------------------------------------------------------------
+    logic cache_accept[N_CACHE];
+    assign cache_accept[0] = icache_req_i.valid && icache_rsp_o.wready;
+    assign cache_accept[1] = dcache_req_i.valid && dcache_rsp_o.wready;
+
+    // CPU consumed the queue head.
+    logic cache_pop[N_CACHE];
+    assign cache_pop[0] = icache_req_i.rready && icache_rsp_o.rvalid;
+    assign cache_pop[1] = dcache_req_i.rready && dcache_rsp_o.rvalid;
+
+    // Queue push: the tag answer was a load hit.
+    logic cache_push[N_CACHE];
+    assign cache_push[0] = cache_rsp_pulse[0] && cache_hit_pulse[0] && !cmp_we_q[0];
+    assign cache_push[1] = cache_rsp_pulse[1] && cache_hit_pulse[1] && !cmp_we_q[1];
+
+    logic [MEM_WIDTH-1:0] cache_push_data[N_CACHE];
+    assign cache_push_data[0] = icache_push_data;
+    assign cache_push_data[1] = dcache_push_data;
+
+    // An unresolved miss (pending pickup or owned by the FSM) older than
+    // the entry being pushed blocks that entry: responses must be delivered
+    // in accept order (the fetch unit's instruction buffer relies on it).
+    logic older_miss[N_CACHE];
+    assign older_miss[0] = (|slot_miss_q[0]) || slot_miss_wait[0];
+    assign older_miss[1] = (|slot_miss_q[1]) || slot_miss_wait[1];
 
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            icache_way_hit_q  <= '0;
-            dcache_way_hit_q  <= '0;
-            icache_word_sel_q <= '0;
-            dcache_word_sel_q <= '0;
+            for (int c = 0; c < N_CACHE; c++) begin
+                skid_q[c][0]        <= '0;
+                skid_q[c][1]        <= '0;
+                skid_valid_q[c][0]  <= 1'b0;
+                skid_valid_q[c][1]  <= 1'b0;
+                slot_lookup_q[c][0] <= 1'b0;
+                slot_lookup_q[c][1] <= 1'b0;
+                slot_rsp_q[c][0]    <= 1'b0;
+                slot_rsp_q[c][1]    <= 1'b0;
+                miss_seen_q[c][0]   <= 1'b0;
+                miss_seen_q[c][1]   <= 1'b0;
+                slot_miss_q[c][0]   <= 1'b0;
+                slot_miss_q[c][1]   <= 1'b0;
+                rq_q[c][0]          <= '0;
+                rq_q[c][1]          <= '0;
+                rq_blk_q[c][0]      <= 1'b0;
+                rq_blk_q[c][1]      <= 1'b0;
+                rq_cnt_q[c]         <= '0;
+                cmp_tag_q[c]        <= '0;
+                cmp_dw_sel_q[c]     <= '0;
+                cmp_we_q[c]         <= 1'b0;
+            end
         end else begin
-            imem_rsp_q        <= imem_rsp_d;
-            dmem_rsp_q        <= dmem_rsp_d;
-            icache_way_hit_q  <= icache_way_hit;
-            dcache_way_hit_q  <= dcache_way_hit;
-            icache_word_sel_q <= mask[0];
-            dcache_word_sel_q <= mask[1];
+            for (int c = 0; c < N_CACHE; c++) begin
+                // Accept: fill the first free slot (wready guarantees one).
+                if (cache_accept[c]) begin
+                    skid_q[c][slot_free[c]]        <= (c == 0) ? icache_req_i : dcache_req_i;
+                    skid_valid_q[c][slot_free[c]]  <= 1'b1;
+                    slot_lookup_q[c][slot_free[c]] <= 1'b0;
+                    slot_rsp_q[c][slot_free[c]]    <= 1'b0;
+                    miss_seen_q[c][slot_free[c]]   <= 1'b0;
+                    slot_miss_q[c][slot_free[c]]   <= 1'b0;
+                end
+
+                // Lookup launch for the (single) un-launched slot.
+                if (cache_lookup_go[c]) begin
+                    slot_lookup_q[c][slot_lookup_sel[c]] <= 1'b1;
+                    slot_rsp_q[c][slot_lookup_sel[c]]    <= 1'b1;
+                    cmp_tag_q[c]                         <= tag[c];
+                    cmp_dw_sel_q[c]                      <= dw_sel[c];
+                    cmp_we_q[c]                          <= cache_req[c].we;
+                end
+
+                // Tag answer for the slot it belongs to (answer order =
+                // launch order = accept order).
+                if (cache_rsp_pulse[c]) begin
+                    slot_rsp_q[c][slot_rsp_sel[c]] <= 1'b0;
+                    if (cache_hit_pulse[c]) skid_valid_q[c][slot_rsp_sel[c]] <= 1'b0;
+                    else miss_seen_q[c][slot_rsp_sel[c]] <= 1'b1;
+                end
+
+                // Response queue. Push+pop collides only at cnt==1 (head
+                // consumed and new tail pushed the same cycle, count
+                // unchanged); push at cnt==2 is impossible because
+                // outstanding <= SKID_DEPTH[c] bounds queue entries.
+                if (cache_push[c] && cache_pop[c]) begin
+                    rq_q[c][0]     <= cache_push_data[c];
+                    rq_blk_q[c][0] <= older_miss[c];
+                end else if (cache_push[c]) begin
+                    rq_cnt_q[c]                            <= rq_cnt_q[c] + 2'd1;
+                    rq_q[c][(rq_cnt_q[c]==2'd0)?0 : 1]     <= cache_push_data[c];
+                    rq_blk_q[c][(rq_cnt_q[c]==2'd0)?0 : 1] <= older_miss[c];
+                end else if (cache_pop[c]) begin
+                    rq_cnt_q[c]    <= rq_cnt_q[c] - 2'd1;
+                    rq_q[c][0]     <= rq_q[c][1];
+                    rq_blk_q[c][0] <= rq_blk_q[c][1];
+                end
+
+                // FSM pickup of the oldest missed slot.
+                if (cache_fsm_latch[c]) begin
+                    miss_seen_q[c][slot_miss_sel[c]] <= 1'b0;
+                    slot_miss_q[c][slot_miss_sel[c]] <= 1'b1;
+                end
+            end
         end
     end
 
@@ -439,10 +670,23 @@ module cache_cntrl #(
     logic [MEM_WIDTH-1:0] miss_addr_q, miss_addr_d;
 
     logic miss_pending;
-    // itag_rsp/dtag_rsp[*].rvalid are identical across ways (same broadcast
-    // lookup, same native_ram latency), so way 0 is a valid representative.
-    assign
-        miss_pending = (itag_rsp[0].rvalid && !icache_hit) || (dtag_rsp[0].rvalid && !dcache_hit);
+    logic miss_sel;  // 0 = icache, 1 = dcache (the entry the FSM will pick up)
+    logic cache_fsm_latch[N_CACHE];
+
+    // A miss is pending from its lookup's response until the FSM latches it
+    // (miss_seen_q is a one-shot per request, not a per-cycle level — the
+    // FSM will not re-refill the same line forever after returning to
+    // S_IDLE). Fixed priority: dcache wins ties (avoids stalling stores);
+    // the loser keeps its miss_seen_q slot until the FSM comes back. The
+    // FSM pickup does NOT free the skid slot: the slot stays occupied
+    // (slot_miss_q) so no younger response can pass the older miss; it is
+    // unstalled when the miss completes (S_UPDATE_TAG, TODO Phase 4).
+    assign miss_pending = slot_miss_wait[0] || slot_miss_wait[1];
+    assign miss_sel     = slot_miss_wait[1];
+
+    wire fsm_latch_miss = (state_q == S_IDLE) && miss_pending;
+    assign cache_fsm_latch[0] = fsm_latch_miss && !miss_sel;
+    assign cache_fsm_latch[1] = fsm_latch_miss && miss_sel;
 
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
@@ -469,8 +713,9 @@ module cache_cntrl #(
         miss_addr_d         = miss_addr_q;
 
         sdrc_cmd_en         = 1'b0;
-        sdrc_cmd            = 3'b000;  // TODO: confirm encoding vs SDRAM HS IP doc
+        sdrc_cmd            = SDRC_CMD_NOP;  // encoding from yarv32_cache_pkg (see TODO there)
         sdrc_addr           = '0;
+        sdrc_dqm            = 4'h0;  // all bytes enabled; the FSM never masks
         sdrc_data           = '0;
         sdrc_data_len       = '0;
         sdrc_precharge_ctrl = 1'b0;
@@ -482,9 +727,12 @@ module cache_cntrl #(
             S_IDLE: begin
                 burst_cnt_d = '0;
                 if (miss_pending) begin
-                    // Fixed priority: dcache wins ties (avoids stalling stores)
-                    req_sel_d   = dtag_rsp[0].rvalid && !dcache_hit;
-                    miss_addr_d = req_sel_d ? dcache_req_i.addr : icache_req_i.addr;
+                    // Fixed priority: dcache wins ties (avoids stalling
+                    // stores). cache_fsm_latch (above) marks the picked-up
+                    // slot slot_miss_q; the FSM owns it until the miss
+                    // completes.
+                    req_sel_d   = miss_sel;
+                    miss_addr_d = skid_q[miss_sel][slot_miss_sel[miss_sel]].addr;
                     state_d     = S_ARBITRATE;
                 end
             end
@@ -497,8 +745,13 @@ module cache_cntrl #(
 
             S_WB_REQ: begin
                 sdrc_cmd_en   = 1'b1;
-                sdrc_cmd      = 3'b001;  // TODO: write command encoding
-                sdrc_addr     = miss_addr_q[MEM_SIZE-1-:21];  // TODO: bank/row/col mapping
+                sdrc_cmd      = SDRC_CMD_WRITE;
+                // Line-aligned burst start: strip the intra-line offset so the
+                // burst covers exactly the one 32-byte line being written
+                // back (a mid-line miss_addr_q would otherwise straddle two
+                // lines). Word address = line byte base >> 2.
+                // TODO: bank/row/col mapping for the real IP.
+                sdrc_addr     = {miss_addr_q[MEM_SIZE-1:NBIT_OFFSET], {(NBIT_OFFSET - 2) {1'b0}}};
                 sdrc_data     = line_buf_q[burst_cnt_q*32+:32];
                 sdrc_data_len = BURST_LEN[7:0];
                 if (sdrc_cmd_ack) begin
@@ -520,8 +773,11 @@ module cache_cntrl #(
 
             S_REFILL_REQ: begin
                 sdrc_cmd_en   = 1'b1;
-                sdrc_cmd      = 3'b010;  // TODO: read command encoding
-                sdrc_addr     = miss_addr_q[MEM_SIZE-1-:21];
+                sdrc_cmd      = SDRC_CMD_READ;
+                // Line-aligned burst start, same as S_WB_REQ: the refill
+                // reads exactly the missing line, word 0 first.
+                // TODO: bank/row/col mapping for the real IP.
+                sdrc_addr     = {miss_addr_q[MEM_SIZE-1:NBIT_OFFSET], {(NBIT_OFFSET - 2) {1'b0}}};
                 sdrc_data_len = BURST_LEN[7:0];
                 if (sdrc_cmd_ack) state_d = S_REFILL_WAIT;
             end
@@ -538,7 +794,7 @@ module cache_cntrl #(
                 // TODO: drive itag_req/dtag_req (we=1, addr=set_idx<<TAG_BYTES_W,
                 // wdata={tag,dirty=0,valid=1}) and imem_req/dmem_req to commit
                 // line_buf_q, then unstall the requester (icache_rsp_o/dcache_rsp_o).
-                // Tag field width is TAG_FIELD_W (11 classic / 18 hashed).
+                // Tag field width is TAG_FIELD_W.
                 state_d = S_IDLE;
             end
 
@@ -547,35 +803,27 @@ module cache_cntrl #(
     end
 
     // -------------------------------------------------------------
-    // CPU-facing response: hit-way line mux + 32-bit word select
+    // CPU-facing response: the response-queue head.
+    //   rvalid is a LEVEL, held until the CPU's rready pops the head
+    //   (protocol compliance — the old design exposed the lookup's
+    //   one-cycle pulse and lost reads whenever rready was low).
+    //   A queue entry pushed while an older miss was unresolved is blocked
+    //   (rq_blk_q) until that miss completes — responses are delivered in
+    //   accept order, which the fetch unit's instruction buffer relies on.
+    //   wready accepts while outstanding (occupied slots + unconsumed
+    //   entries) is below the per-port limit: 2 for the I-port's 2
+    //   outstanding reads, 1 for the single-outstanding D-port. Hits are
+    //   served while the miss FSM is mid-transit; only unresolved-miss
+    //   slots gate delivery.
     // -------------------------------------------------------------
-    // imem_rsp_q/dmem_rsp_q each hold one full 256-bit line per way; the
-    // winning way is the one whose tag hit (registered, same pipeline stage
-    // as the data). The requested 32-bit word inside that line is selected
-    // by the intra-line word offset (mask, i.e. addr[NBIT_OFFSET-1:2]).
-    // TODO: rdata is MEM_WIDTH=64 bits but the select granularity is 32 bits;
-    // 64-bit CPU accesses need a doubleword select (addr[NBIT_OFFSET-1:3]).
-    logic [DATA_WIDTH-1:0] icache_line, dcache_line;
-
-    always_comb begin
-        icache_line = '0;
-        dcache_line = '0;
-        for (int i = 0; i < N_WAY; i++) begin
-            if (icache_way_hit_q[i]) icache_line = imem_rsp_q[i].rdata;
-            if (dcache_way_hit_q[i]) dcache_line = dmem_rsp_q[i].rdata;
-        end
-    end
-
-    // wready: cache accepts a new CPU request only while the miss FSM is idle
-    // (hit path needs no FSM cycles; a miss stalls the requester).
-    assign icache_rsp_o.wready = (state_q == S_IDLE);
-    assign icache_rsp_o.rvalid = imem_rsp_q[0].rvalid && (|icache_way_hit_q);
-    assign icache_rsp_o.rdata  = icache_line[icache_word_sel_q*64+:64];
+    assign icache_rsp_o.wready = (slot_outstanding[0] < SKID_DEPTH[0]);
+    assign icache_rsp_o.rvalid = (rq_cnt_q[0] != 2'd0) && !rq_blk_q[0][0];
+    assign icache_rsp_o.rdata  = rq_q[0][0];
     assign icache_rsp_o.bvalid = 1'b0;  // posted stores, no B channel
 
-    assign dcache_rsp_o.wready = (state_q == S_IDLE);
-    assign dcache_rsp_o.rvalid = dmem_rsp_q[0].rvalid && (|dcache_way_hit_q);
-    assign dcache_rsp_o.rdata  = icache_line[dcache_word_sel_q*64+:64];
+    assign dcache_rsp_o.wready = (slot_outstanding[1] < SKID_DEPTH[1]);
+    assign dcache_rsp_o.rvalid = (rq_cnt_q[1] != 2'd0) && !rq_blk_q[1][0];
+    assign dcache_rsp_o.rdata  = rq_q[1][0];
     assign dcache_rsp_o.bvalid = 1'b0;  // posted stores, no B channel
 
 `ifdef VERILATOR
@@ -613,24 +861,6 @@ module cache_cntrl #(
     assign itag0_rsp_rvalid = itag_rsp[0].rvalid;
     assign itag0_rsp_rdata  = itag_rsp[0].rdata;
     assign itag0_rsp_bvalid = itag_rsp[0].bvalid;
-
-    logic                  imem0_rsp_q_wready;
-    logic                  imem0_rsp_q_rvalid;
-    logic [DATA_WIDTH-1:0] imem0_rsp_q_rdata;
-    logic                  imem0_rsp_q_bvalid;
-    assign imem0_rsp_q_wready = imem_rsp_q[0].wready;
-    assign imem0_rsp_q_rvalid = imem_rsp_q[0].rvalid;
-    assign imem0_rsp_q_rdata  = imem_rsp_q[0].rdata;
-    assign imem0_rsp_q_bvalid = imem_rsp_q[0].bvalid;
-
-    logic        icache0_rsp_o_wready;
-    logic        icache0_rsp_o_rvalid;
-    logic [63:0] icache0_rsp_o_rdata;
-    logic        icache0_rsp_o_bvalid;
-    assign icache0_rsp_o_wready = icache_rsp_o.wready;
-    assign icache0_rsp_o_rvalid = icache_rsp_o.rvalid;
-    assign icache0_rsp_o_rdata  = icache_rsp_o.rdata;
-    assign icache0_rsp_o_bvalid = icache_rsp_o.bvalid;
 
 `endif
 

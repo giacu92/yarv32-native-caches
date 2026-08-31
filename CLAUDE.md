@@ -71,20 +71,24 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   subfolder holds IP build logs/reports — do not hand-edit.
 - `sim/sim_top.sv` — Verilator testbench / sim top (clock, reset, drives
   the I/D-cache `mem_req_t` interfaces, dumps `sim_top.vcd`). Compiles with
-  `--timing`. Self-checking: three phases (I-hit / I-miss / D-hit) with
-  PASS/FAIL counters and a 300-cycle watchdog; assertions are on
-  hierarchical internals (`u_dut.icache_hit`, `u_dut.state_q`), not the
-  CPU-facing outputs, because those are undriven (see TODOs). Preloads the
-  tag/data macros by hierarchical reference (`u_dut.gen_way[w].u_itag.mem`
-  etc.) at time 0. `+IINIT`/`+DINIT` plusargs are echoed but ignored —
-  the preload is always the hierarchical one above.
+  `--timing`. Self-checking: phases A (I-hit way 0), D (response held with
+  `rready=0` + 2 outstanding I-port reads returned in order), E (I-hit on
+  way 1 alone — per-way comparator + hit-way data mux), F (simultaneous
+  I+D hits), B (I-miss), C (D-hit), H (D-miss with both ways valid, i.e.
+  the miss-detection half of an eviction) with PASS/FAIL counters,
+  expected-`rdata` checks on the hit phases, and a 300-cycle watchdog.
+  Miss phases run last: a miss wedges its port until the Phase-4 unstall
+  exists. Preloads the tag/data macros by hierarchical reference
+  (`u_dut.gen_way[w].u_itag.mem` etc.) at time 0, indexed by the plain set
+  index (the DUT applies the `TAG_BYTES_W` shift itself).
 - `sim/sdram_stub.sv` — behavioral replacement for `SDRAM_Controller_HS_Top`
   (identical port list). The real IP netlist (`.vo` Gowin primitives /
   encrypted `.vg`) is not Verilator-simulatable, so the sim file list
   includes this stub instead of `src/ips/...`. Transactional model: 8 MiB
   backing array, combinational `cmd_ack`, streams refill data one
-  32-bit word/cycle (matches the FSM's `S_REFILL_WAIT`). Its `CMD_WRITE`/
-  `CMD_READ` encodings mirror the FSM's *placeholder* values, so the sim
+  32-bit word/cycle (matches the FSM's `S_REFILL_WAIT`). It uses the same
+  `SDRC_CMD_*` localparams as the FSM (shared via `yarv32_cache_pkg`), but
+  those values are *placeholders* pending the IP docs, so the sim
   cannot catch a wrong command encoding against the real IP.
 
 ## Protocol: mem_req_t / mem_rsp_t
@@ -141,8 +145,12 @@ Set-associativity is implemented via a `generate for (w = 0; w < N_WAY; w++)`
 loop instantiating `N_WAY` parallel `native_ram` macros for data and for
 tags, both for I-cache and D-cache. Data macros are sized
 `WAY_ADDR_W = CACHE_SIZE - $clog2(N_WAY)` (halved per doubling of ways, so
-total capacity is unchanged). Tag macros stay `NBIT_SET_IDX` wide — already
-per-set, unaffected by way count. The tag lookup request (`set_idx`) is
+total capacity is unchanged). Tag macros are
+`TAG_ADDR_W = NBIT_SET_IDX + TAG_BYTES_W` wide — one tag word per set
+(`native_ram` decodes `word_addr = addr[TAG_ADDR_W-1:TAG_BYTES_W]` =
+`set_idx`; a `NBIT_SET_IDX`-only `ADDR_W` would alias sets
+`2**TAG_BYTES_W` apart onto one tag word — an elaboration-time Verilator
+assert in `cache_cntrl` guards the depth). The tag lookup request (`set_idx`) is
 broadcast to all ways in parallel; tag compare and hit detection are fully
 parallel (`N_WAY` comparators per cache), not time-multiplexed.
 
@@ -169,18 +177,32 @@ source:
   `icache_rsp_o`/`dcache_rsp_o`.
 - Cache data path (`imem_req[w]`/`dmem_req[w]`) is wired to the RAM
   macros; hit-store `wstrb` muxing is still TODO (`wstrb` tied to 0 in the
-  speculative-read block). The `imem_rsp_q`/`dmem_rsp_q` pipeline registers
-  feed the hit-way line mux.
-- `icache_rsp_o`/`dcache_rsp_o` are driven on a hit (hit-way mux + 32-bit
-  word select by intra-line offset, registered one stage after the RAM
-  outputs; `wready` only while the miss FSM is idle). A miss still never
-  unstalls the requester, and `rdata` is zero-extended 32-bit granularity
-  while the CPU-side bus is 64-bit.
+  speculative-read block). Hit responses are captured at the tag-answer
+  cycle off the RAW macro outputs (`imem_rsp_d`/`dmem_rsp_d`).
+- `icache_rsp_o`/`dcache_rsp_o` (TODO.md Phase 3 done): requests go through
+  a 2-slot registered skid per cache (`skid_q`); lookups fire once per
+  request off the registered slot address, and the compare context
+  (`cmp_tag_q`/`cmp_dw_sel_q`/`cmp_we_q`) is registered at launch so
+  back-to-back lookups cannot cross-compare. Hit data (hit-way mux + 64-bit
+  doubleword select by `addr[NBIT_OFFSET-1:3]`) is pushed onto a per-cache
+  response queue; `rvalid` is a LEVEL held until `rready` pops the head.
+  `wready = outstanding < SKID_DEPTH[c]` where outstanding counts occupied
+  skid slots plus unconsumed queue entries: 2 for the I-port (fetch unit's
+  2 outstanding reads, in-order delivery — entries pushed while an older
+  miss was unresolved are blocked behind it, `rq_blk_q`), 1 for the
+  single-outstanding D-port. Hits are served while the miss FSM is
+  mid-transit. A miss keeps its skid slot occupied (`slot_miss_q`) and
+  still never unstalls the requester (TODO.md Phase 4).
 - `S_WB_WAIT` keys its completion off `sdrc_init_done` (a placeholder, not
   a real write-completion signal); `S_REFILL_WAIT` assumes one 32-bit word
   per cycle with no per-word data-valid strobe.
 
 ## Completion plan
+
+**Superseded by `TODO.md`** (which folds the review findings from the
+hashed-index "wip" commit into the phase order and adds the FPGA
+build/bring-up phases for the Tang Nano 20K). The list below is kept for
+reference; item numbering below is cited in older notes.
 
 Each phase keeps `make sim` green and `make format-check` clean.
 
@@ -278,9 +300,11 @@ Each phase keeps `make sim` green and `make format-check` clean.
 
 The sim currently passes only because Verilator is 2-state (zeroes the
 unreset `victim_dirty_q`), the stub ignores `sdrc_dqm` and mirrors the
-placeholder command encodings, and the testbench waits 5 cycles per phase
-and only exercises set 0/13 — none of the findings above are caught by the
-existing self-checks.
+placeholder command encodings. Since the Phase-0 regression fixes
+(2026-08-31) the testbench also checks `rdata` on the hit phases and
+exercises the tag comparator on the miss, but it still waits 5 cycles per
+phase, drives only set 0/13, and never tests stores, evictions, or the
+miss-refill datapath — TODO.md Phase 7 covers the BFM-based hardening.
 
 ## Tooling
 

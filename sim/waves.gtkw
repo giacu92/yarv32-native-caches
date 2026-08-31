@@ -1,15 +1,15 @@
 [*]
 [*] GTKWave Analyzer v3.3.126 (w)1999-2026 BSI
-[*] Sat Aug 29 23:07:31 2026
+[*] Mon Aug 31 21:09:08 2026
 [*]
 [dumpfile] "/home/giacomo/gowin_proj/yarv-native-cache/sim/sim_top.vcd"
-[dumpfile_mtime] "Sat Aug 29 23:06:21 2026"
-[dumpfile_size] 68819
+[dumpfile_mtime] "Mon Aug 31 21:07:59 2026"
+[dumpfile_size] 106191
 [savefile] "/home/giacomo/gowin_proj/yarv-native-cache/sim/waves.gtkw"
 [timestart] 0
 [size] 1920 1105
 [pos] -1 -1
-*-14.857630 73300 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+*-16.514429 185000 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
 [treeopen] sim_top.
 [treeopen] sim_top.u_dut.
 [treeopen] sim_top.u_dut.gen_way[0].
@@ -17,6 +17,11 @@
 [signals_width] 452
 [sst_expanded] 1
 [sst_vpaned_height] 617
+@28
+sim_top.u_dut.clk_i
+sim_top.u_dut.rstn_i
+@201
+-
 @200
 -Read Req - IMEM
 @28
@@ -31,78 +36,40 @@ sim_top.u_dut.icache_req_wdata[63:0]
 sim_top.u_dut.icache_req_wstrb[7:0]
 @200
 -
-@28
-sim_top.u_dut.HASH_INDEX
 @22
 sim_top.u_dut.set_idx[13:0]
-sim_top.u_dut.tag[35:0]
 @200
 -
 -TAG Ram 0
-@22
-sim_top.u_dut.gen_way[0].u_itag.word_addr[4:0]
 @28
 sim_top.u_dut.gen_way[0].u_itag.launch_read
 sim_top.u_dut.gen_way[0].u_itag.launch_write
 sim_top.u_dut.gen_way[0].u_itag.rvalid_q
 sim_top.u_dut.gen_way[0].u_itag.rsp_done
-@22
-sim_top.u_dut.gen_way[0].u_itag.mem[9][23:0]
-sim_top.u_dut.gen_way[0].u_itag.rdata_q[23:0]
 @200
 -
 -Hit Logic
-@22
-sim_top.u_dut.itag0_rsp_rdata[23:0]
 @28
 sim_top.u_dut.icache_hit
 sim_top.u_dut.icache_valid[1:0]
 sim_top.u_dut.icache_dirty[1:0]
 sim_top.u_dut.icache_way_hit[1:0]
-@c00022
-sim_top.u_dut.icache_tag_stored[35:0]
-@28
-(0)sim_top.u_dut.icache_tag_stored[35:0]
-(1)sim_top.u_dut.icache_tag_stored[35:0]
-(2)sim_top.u_dut.icache_tag_stored[35:0]
-(3)sim_top.u_dut.icache_tag_stored[35:0]
-(4)sim_top.u_dut.icache_tag_stored[35:0]
-(5)sim_top.u_dut.icache_tag_stored[35:0]
-(6)sim_top.u_dut.icache_tag_stored[35:0]
-(7)sim_top.u_dut.icache_tag_stored[35:0]
-(8)sim_top.u_dut.icache_tag_stored[35:0]
-(9)sim_top.u_dut.icache_tag_stored[35:0]
-(10)sim_top.u_dut.icache_tag_stored[35:0]
-(11)sim_top.u_dut.icache_tag_stored[35:0]
-(12)sim_top.u_dut.icache_tag_stored[35:0]
-(13)sim_top.u_dut.icache_tag_stored[35:0]
-(14)sim_top.u_dut.icache_tag_stored[35:0]
-(15)sim_top.u_dut.icache_tag_stored[35:0]
-(16)sim_top.u_dut.icache_tag_stored[35:0]
-(17)sim_top.u_dut.icache_tag_stored[35:0]
-(18)sim_top.u_dut.icache_tag_stored[35:0]
-(19)sim_top.u_dut.icache_tag_stored[35:0]
-(20)sim_top.u_dut.icache_tag_stored[35:0]
-(21)sim_top.u_dut.icache_tag_stored[35:0]
-(22)sim_top.u_dut.icache_tag_stored[35:0]
-(23)sim_top.u_dut.icache_tag_stored[35:0]
-(24)sim_top.u_dut.icache_tag_stored[35:0]
-(25)sim_top.u_dut.icache_tag_stored[35:0]
-(26)sim_top.u_dut.icache_tag_stored[35:0]
-(27)sim_top.u_dut.icache_tag_stored[35:0]
-(28)sim_top.u_dut.icache_tag_stored[35:0]
-(29)sim_top.u_dut.icache_tag_stored[35:0]
-(30)sim_top.u_dut.icache_tag_stored[35:0]
-(31)sim_top.u_dut.icache_tag_stored[35:0]
-(32)sim_top.u_dut.icache_tag_stored[35:0]
-(33)sim_top.u_dut.icache_tag_stored[35:0]
-(34)sim_top.u_dut.icache_tag_stored[35:0]
-(35)sim_top.u_dut.icache_tag_stored[35:0]
-@1401200
--group_end
 @200
 -
--ICHACHE0
+@28
+sim_top.u_dut.miss_pending
+@22
+sim_top.u_dut.sdrc_addr[20:0]
+sim_top.u_dut.sdrc_data[31:0]
+sim_top.u_dut.sdrc_data_len[7:0]
+@28
+sim_top.u_dut.sdrc_cmd_ack
+sim_top.u_dut.sdrc_init_done
+@22
+sim_top.u_dut.sdrc_data_out[31:0]
+@200
+-
+-
 @22
 sim_top.u_dut.gen_way[0].u_icache.word_addr[6:0]
 @28
@@ -114,85 +81,25 @@ sim_top.u_dut.gen_way[0].u_icache.rsp_done
 sim_top.u_dut.gen_way[0].u_icache.rdata_q[255:0]
 @200
 -
-@22
-sim_top.u_dut.offset[9:0]
-sim_top.u_dut.icache_line[255:0]
-sim_top.u_dut.icache0_rsp_o_rdata[63:0]
-@200
 -
-@c00023
-sim_top.u_dut.icache_rsp_o[66:0]
-@28
-(0)sim_top.u_dut.icache_rsp_o[66:0]
-(1)sim_top.u_dut.icache_rsp_o[66:0]
-(2)sim_top.u_dut.icache_rsp_o[66:0]
-(3)sim_top.u_dut.icache_rsp_o[66:0]
-(4)sim_top.u_dut.icache_rsp_o[66:0]
-(5)sim_top.u_dut.icache_rsp_o[66:0]
-(6)sim_top.u_dut.icache_rsp_o[66:0]
-(7)sim_top.u_dut.icache_rsp_o[66:0]
-(8)sim_top.u_dut.icache_rsp_o[66:0]
-(9)sim_top.u_dut.icache_rsp_o[66:0]
-(10)sim_top.u_dut.icache_rsp_o[66:0]
-(11)sim_top.u_dut.icache_rsp_o[66:0]
-(12)sim_top.u_dut.icache_rsp_o[66:0]
-(13)sim_top.u_dut.icache_rsp_o[66:0]
-(14)sim_top.u_dut.icache_rsp_o[66:0]
-(15)sim_top.u_dut.icache_rsp_o[66:0]
-(16)sim_top.u_dut.icache_rsp_o[66:0]
-(17)sim_top.u_dut.icache_rsp_o[66:0]
-(18)sim_top.u_dut.icache_rsp_o[66:0]
-(19)sim_top.u_dut.icache_rsp_o[66:0]
-(20)sim_top.u_dut.icache_rsp_o[66:0]
-(21)sim_top.u_dut.icache_rsp_o[66:0]
-(22)sim_top.u_dut.icache_rsp_o[66:0]
-(23)sim_top.u_dut.icache_rsp_o[66:0]
-(24)sim_top.u_dut.icache_rsp_o[66:0]
-(25)sim_top.u_dut.icache_rsp_o[66:0]
-(26)sim_top.u_dut.icache_rsp_o[66:0]
-(27)sim_top.u_dut.icache_rsp_o[66:0]
-(28)sim_top.u_dut.icache_rsp_o[66:0]
-(29)sim_top.u_dut.icache_rsp_o[66:0]
-(30)sim_top.u_dut.icache_rsp_o[66:0]
-(31)sim_top.u_dut.icache_rsp_o[66:0]
-(32)sim_top.u_dut.icache_rsp_o[66:0]
-(33)sim_top.u_dut.icache_rsp_o[66:0]
-(34)sim_top.u_dut.icache_rsp_o[66:0]
-(35)sim_top.u_dut.icache_rsp_o[66:0]
-(36)sim_top.u_dut.icache_rsp_o[66:0]
-(37)sim_top.u_dut.icache_rsp_o[66:0]
-(38)sim_top.u_dut.icache_rsp_o[66:0]
-(39)sim_top.u_dut.icache_rsp_o[66:0]
-(40)sim_top.u_dut.icache_rsp_o[66:0]
-(41)sim_top.u_dut.icache_rsp_o[66:0]
-(42)sim_top.u_dut.icache_rsp_o[66:0]
-(43)sim_top.u_dut.icache_rsp_o[66:0]
-(44)sim_top.u_dut.icache_rsp_o[66:0]
-(45)sim_top.u_dut.icache_rsp_o[66:0]
-(46)sim_top.u_dut.icache_rsp_o[66:0]
-(47)sim_top.u_dut.icache_rsp_o[66:0]
-(48)sim_top.u_dut.icache_rsp_o[66:0]
-(49)sim_top.u_dut.icache_rsp_o[66:0]
-(50)sim_top.u_dut.icache_rsp_o[66:0]
-(51)sim_top.u_dut.icache_rsp_o[66:0]
-(52)sim_top.u_dut.icache_rsp_o[66:0]
-(53)sim_top.u_dut.icache_rsp_o[66:0]
-(54)sim_top.u_dut.icache_rsp_o[66:0]
-(55)sim_top.u_dut.icache_rsp_o[66:0]
-(56)sim_top.u_dut.icache_rsp_o[66:0]
-(57)sim_top.u_dut.icache_rsp_o[66:0]
-(58)sim_top.u_dut.icache_rsp_o[66:0]
-(59)sim_top.u_dut.icache_rsp_o[66:0]
-(60)sim_top.u_dut.icache_rsp_o[66:0]
-(61)sim_top.u_dut.icache_rsp_o[66:0]
-(62)sim_top.u_dut.icache_rsp_o[66:0]
-(63)sim_top.u_dut.icache_rsp_o[66:0]
-(64)sim_top.u_dut.icache_rsp_o[66:0]
-(65)sim_top.u_dut.icache_rsp_o[66:0]
-(66)sim_top.u_dut.icache_rsp_o[66:0]
-@1401201
--group_end
-@200
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
 -
 -
 -
