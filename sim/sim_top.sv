@@ -18,18 +18,27 @@ import yarv32_cache_pkg::*;
  *   D: I-port response-queue behavior: a read issued with rready=0 must be
  *      HELD (not lost), a second read must be accepted while the first is
  *      unconsumed (2 outstanding, I-port only), and both responses must
- *      come back in accept order. Runs before B because B's miss wedges the
- *      I-port until the Phase-4 unstall exists.
+ *      come back in accept order.
  *   B: I-cache miss at ADDR_I_MISS (set 0 preloaded with a VALID tag of a
  *      different value, so the phase exercises the tag comparator, not
  *      just the valid bit)
+ *   M: the Phase-B miss must COMPLETE: the unstall pushes the response
+ *      (refilled SDRAM data), and a re-request of the same address must
+ *      HIT with identical data (line commit + tag write).
  *   C: D-cache hit  at ADDR_D_HIT with expected-rdata check
  *   E: I-cache hit on WAY 1 alone (per-way comparator + hit-way data mux)
  *   F: simultaneous I+D hits in the same cycle (per-cache independence)
- *   H: D-cache miss with BOTH ways valid (neither tag matches): the
- *      miss-detection half of an eviction. Eviction itself (victim
- *      selection, writeback) is TODO Phase 4 — a miss wedges the port
- *      until the Phase-4 unstall, so both miss phases run last.
+ *   H: D-cache miss with BOTH ways valid (neither tag matches)
+ *   S: D-cache store hit (posted, no response): data-macro write into the
+ *      hit way + dirty bit; a following load returns the stored value and
+ *      the line's other doublewords are untouched (byte-strobe positioning)
+ *   V: full dirty eviction (set 77, both ways valid): a store makes way
+ *      0's line dirty, a miss to the same set evicts it (round-robin
+ *      victim, both ways valid) and the writeback must land at the VICTIM's
+ *      SDRAM address — re-loading the evicted address returns the stored
+ *      value via the writeback round-trip. V4: a store MISS (tag 0x444,
+ *      same set) is write-allocated — only the low 4 bytes of doubleword 0
+ *      are strobed, so the merged line must keep SDRAM's high 4 bytes.
  */
 
 module sim_top;
@@ -125,6 +134,22 @@ module sim_top;
 
     localparam int DATA_WORD_I_WAY1 = int'(ADDR_I_WAY1[NBIT_OFFSET+:NBIT_SET_IDX]);
 
+    // Phase-S store value (posted store hit at ADDR_D_HIT, doubleword 0).
+    localparam logic [63:0] STORE_VAL = 64'h1234_5678_9ABC_DEF0;
+
+    // Phase-V dirty eviction, set 77 (0x4D): way 0 holds line A (tag 0x111),
+    // way 1 holds a valid filler line (tag 0x333), so a miss on tag 0x222
+    // forces a round-robin victim (both ways valid). Both addresses are
+    // offset 0, so doubleword 0 is the first two SDRAM words of each line.
+    localparam logic [22:0] ADDR_A_EV = 23'h1119A0;  // set 77, tag 0x111
+    localparam logic [22:0] ADDR_B_EV = 23'h2229A0;  // set 77, tag 0x222
+    localparam logic [22:0] ADDR_A_EV_DW1 = ADDR_A_EV + 23'd8;
+
+    // V4/V5 write-allocate test: store-miss into a non-resident line (tag
+    // 0x444, same set), strobing only the low 4 bytes of doubleword 0 —
+    // the merged line must keep SDRAM's high 4 bytes of that doubleword.
+    localparam logic [22:0] ADDR_C_EV = 23'h4449A0;  // set 77, tag 0x444
+
     // Data-macro word index (addr[NBIT_OFFSET +: NBIT_SET_IDX]): the data
     // macros are indexed by the raw CPU address, one 256-bit word per set.
     localparam int DATA_WORD_I_HIT = int'(ADDR_I_HIT[NBIT_OFFSET+:NBIT_SET_IDX]);
@@ -145,6 +170,21 @@ module sim_top;
     function automatic logic [TAG_DATA_W-1:0] tag_word_v(input logic [TAG_FIELD_W-1:0] t);
         tag_word_v = {{(TAG_DATA_W - TAG_FIELD_W - 2) {1'b0}}, t, 1'b0, 1'b1};
     endfunction
+
+    // SDRAM stub backing-store pattern: mem[i] = 32'hCAFE0000 | i[15:0],
+    // i = byte address >> 2. Expected doubleword 0 of the line at a
+    // line-aligned address = {word(addr+4), word(addr)}.
+    function automatic logic [31:0] sdram_word(input logic [22:0] byte_addr);
+        sdram_word = {16'hCAFE, byte_addr[17:2]};
+    endfunction
+
+    function automatic logic [63:0] sdram_line_dw0(input logic [22:0] line_addr);
+        sdram_line_dw0 = {sdram_word(line_addr + 23'd4), sdram_word(line_addr)};
+    endfunction
+
+    // V4/V5: expected doubleword 0 of the write-allocated line — the store
+    // strobes only the low 4 bytes, so the high 4 stay the SDRAM pattern.
+    localparam logic [63:0] MERGE_VAL = {sdram_word(ADDR_C_EV + 23'd4), STORE_VAL[31:0]};
 
     initial begin
         $display("[sim_top] TAG_FIELD_W=%0d TAG_DATA_W=%0d", TAG_FIELD_W, TAG_DATA_W);
@@ -187,12 +227,21 @@ module sim_top;
         // requested tag.
         u_dut.gen_way[0].u_dtag.mem[set_of(ADDR_D_MISS2)] = tag_word_v(11'h111);
         u_dut.gen_way[1].u_dtag.mem[set_of(ADDR_D_MISS2)] = tag_word_v(11'h222);
+
+        // Phase-V eviction set 77: way 0 = line A (tag 0x111), way 1 = a
+        // valid filler line (tag 0x333, clean). Both valid, so the eviction
+        // victim is the round-robin pointer (way 0 first — line A).
+        u_dut.gen_way[0].u_dtag.mem[set_of(ADDR_A_EV)] = tag_word_v(11'h111);
+        u_dut.gen_way[1].u_dtag.mem[set_of(ADDR_A_EV)] = tag_word_v(11'h333);
+        u_dut.gen_way[0].u_dcache.mem[set_of(ADDR_A_EV)] = LINE_PATTERN;
+        u_dut.gen_way[1].u_dcache.mem[set_of(ADDR_A_EV)] = LINE_PATTERN_W1;
     end
 
-    localparam int N_CYCLES = 300;
+    localparam int N_CYCLES = 800;
     integer error_count;
     integer wait_rsp;
     integer wait_fsm;
+    logic   saw_fsm;
 
     initial begin
         error_count = 0;
@@ -236,6 +285,9 @@ module sim_top;
         // Both responses must arrive in order (A first, then B), and wready
         // must drop once both units are in flight.
         // ----
+        // (Historically ran before the miss phases because a miss wedged
+        // the I-port until the Phase-4 unstall existed; the ordering is now
+        // only conventional.)
         icache_req.valid = 1'b0;  // drain Phase A's in-flight duplicates
         repeat (4) @(posedge clk);
 
@@ -380,6 +432,50 @@ module sim_top;
         icache_req.valid = 1'b0;
         repeat (2) @(posedge clk);
 
+        // ---- Phase M: the Phase-B miss must COMPLETE (Phase 4 unstall):
+        // the response pushed at the unstall carries the refilled SDRAM
+        // data, and a re-request of the same address must HIT with
+        // identical data (line commit + tag write into the victim way),
+        // without re-entering the miss FSM.
+        // ----
+        wait_fsm = 0;
+        while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[0]) && wait_fsm < 120) begin
+            @(posedge clk);  // let the Phase-B transit (and any duplicate
+            // re-accepted request while valid was held) finish: the FSM
+            // parks in S_IDLE for a cycle between back-to-back transits,
+            // so state_q==0 alone is not "settled"
+            wait_fsm = wait_fsm + 1;
+        end
+        repeat (4) @(posedge clk);  // drain leftover queue entries (rready=1)
+
+        icache_req.valid  = 1'b1;
+        icache_req.we     = 1'b0;
+        icache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_I_MISS};
+        icache_req.rready = 1'b1;
+        wait_rsp          = 0;
+        saw_fsm           = 0;
+        while (!icache_rsp.rvalid && wait_rsp < 20) begin
+            @(posedge clk);
+            wait_rsp = wait_rsp + 1;
+            if (u_dut.state_q != 0) saw_fsm = 1;
+        end
+        if (!icache_rsp.rvalid) begin
+            error_count = error_count + 1;
+            $display("FAIL  M: no icache rvalid at 0x%0h within %0d cycles", ADDR_I_MISS, wait_rsp);
+        end else if (icache_rsp.rdata !== sdram_line_dw0(ADDR_I_MISS)) begin
+            error_count = error_count + 1;
+            $display("FAIL  M: refilled icache rdata at 0x%0h expected %h, got %h", ADDR_I_MISS,
+                     sdram_line_dw0(ADDR_I_MISS), icache_rsp.rdata);
+        end else if (saw_fsm) begin
+            error_count = error_count + 1;
+            $display("FAIL  M: re-request of refilled line re-entered the miss FSM");
+        end else begin
+            $display("PASS  M: icache miss completed, refill served then HIT (rdata=%h)",
+                     icache_rsp.rdata);
+        end
+        icache_req.valid = 1'b0;
+        repeat (2) @(posedge clk);
+
         // ---- Phase C: D-cache hit ----
         dcache_req.valid  = 1'b1;
         dcache_req.we     = 1'b0;
@@ -405,11 +501,9 @@ module sim_top;
 
         // ---- Phase H: D-cache miss with BOTH ways valid (set 41: way 0
         // tag 0x111, way 1 tag 0x222, requested 0x300) — the miss-detection
-        // half of an eviction scenario. The eviction itself (victim
-        // selection, writeback, line commit, unstall) is TODO Phase 4, so
-        // this only checks that neither valid-but-different tag produces a
-        // false hit and the FSM takes the miss. Must run last: a miss
-        // wedges the port until the Phase-4 unstall exists.
+        // half of an eviction: neither valid-but-different tag may produce
+        // a false hit, and the FSM must take the miss (which now completes
+        // and unstalls the port; the completion datapath is checked in M/V).
         // ----
         wait_fsm         = 0;
         while (u_dut.state_q != 0 && wait_fsm < 60) begin
@@ -437,6 +531,195 @@ module sim_top;
         end else begin
             $display("PASS  H: dcache MISS with both ways valid at 0x%0h (FSM state=%0s)",
                      ADDR_D_MISS2, u_dut.state_q.name());
+        end
+        dcache_req.valid = 1'b0;
+
+        // ---- Phase S: D-cache store hit (posted). The store must NOT
+        // produce a response; the data-macro write into the hit way and the
+        // dirty-bit tag write land at the tag-answer pulse. A following
+        // load of the same doubleword must return the stored value, and the
+        // line's other doublewords must be untouched (byte-strobe
+        // positioning at cmp_dw_sel_q).
+        // ----
+        wait_fsm         = 0;
+        while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[1]) && wait_fsm < 120) begin
+            @(posedge clk);  // let the Phase-H transit (and any duplicate
+            // re-accepted request while valid was held) finish
+            wait_fsm = wait_fsm + 1;
+        end
+        repeat (4) @(posedge clk);  // drain Phase-H leftovers (rready=1 pops them)
+
+        dcache_req.valid  = 1'b1;
+        dcache_req.we     = 1'b1;
+        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_D_HIT};
+        dcache_req.wdata  = STORE_VAL;
+        dcache_req.wstrb  = 8'hFF;  // all 8 bytes of doubleword 0
+        dcache_req.rready = 1'b1;
+        repeat (4) @(posedge clk);  // accept -> lookup -> pulse/write (posted)
+        dcache_req.valid = 1'b0;
+        dcache_req.we    = 1'b0;
+        repeat (2) @(posedge clk);
+        if (dcache_rsp.rvalid) begin
+            error_count = error_count + 1;
+            $display("FAIL  S0: posted store produced a response (rdata=%h)", dcache_rsp.rdata);
+        end else begin
+            $display("PASS  S0: posted store hit, no response");
+        end
+
+        // Load back the stored doubleword.
+        dcache_req.valid = 1'b1;
+        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_D_HIT};
+        wait_rsp         = 0;
+        while (!dcache_rsp.rvalid && wait_rsp < 20) begin
+            @(posedge clk);
+            wait_rsp = wait_rsp + 1;
+        end
+        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== STORE_VAL) begin
+            error_count = error_count + 1;
+            $display("FAIL  S1: stored doubleword not read back (rvalid=%b expected %h got %h)",
+                     dcache_rsp.rvalid, STORE_VAL, dcache_rsp.rdata);
+        end else begin
+            $display("PASS  S1: stored doubleword read back (rdata=%h)", dcache_rsp.rdata);
+        end
+        dcache_req.valid = 1'b0;
+        repeat (2) @(posedge clk);
+
+        // Load the next doubleword: must be untouched by the store above.
+        dcache_req.valid = 1'b1;
+        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_D_HIT + 23'd8};
+        wait_rsp         = 0;
+        while (!dcache_rsp.rvalid && wait_rsp < 20) begin
+            @(posedge clk);
+            wait_rsp = wait_rsp + 1;
+        end
+        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_DW1) begin
+            error_count = error_count + 1;
+            $display("FAIL  S2: store clobbered the next doubleword (rvalid=%b expected %h got %h)",
+                     dcache_rsp.rvalid, EXP_DW1, dcache_rsp.rdata);
+        end else begin
+            $display("PASS  S2: next doubleword untouched by store (rdata=%h)", dcache_rsp.rdata);
+        end
+        dcache_req.valid = 1'b0;
+        repeat (2) @(posedge clk);
+
+        // ---- Phase V: full dirty eviction (D-cache, set 77, both ways
+        // valid). Way 0 holds line A (tag 0x111); a store makes it dirty,
+        // then a miss on tag 0x222 (same set) evicts it — victim = way 0
+        // (round-robin, both ways valid). The writeback must land at the
+        // VICTIM's address: re-loading A must miss again and return the
+        // STORED value through the writeback round-trip. A writeback to the
+        // wrong address (e.g. the missing line's) fails V2; a clobbered
+        // refill fails V1.
+        // ----
+        // 1. Store to A (way-0 hit in set 77): dw0 = STORE_VAL, dirty=1.
+        dcache_req.valid  = 1'b1;
+        dcache_req.we     = 1'b1;
+        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_A_EV};
+        dcache_req.wdata  = STORE_VAL;
+        dcache_req.wstrb  = 8'hFF;
+        dcache_req.rready = 1'b1;
+        repeat (4) @(posedge clk);
+        dcache_req.valid = 1'b0;
+        dcache_req.we    = 1'b0;
+        repeat (2) @(posedge clk);
+
+        // 2. Load B (set 77, tag 0x222): miss; victim way 0 is dirty ->
+        //    writeback + refill; response must be B's own SDRAM pattern.
+        dcache_req.valid = 1'b1;
+        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_B_EV};
+        wait_rsp         = 0;
+        while (!dcache_rsp.rvalid && wait_rsp < 60) begin
+            @(posedge clk);
+            wait_rsp = wait_rsp + 1;
+        end
+        if (!dcache_rsp.rvalid) begin
+            error_count = error_count + 1;
+            $display("FAIL  V1: evicting miss at 0x%0h never completed", ADDR_B_EV);
+        end else if (dcache_rsp.rdata !== sdram_line_dw0(ADDR_B_EV)) begin
+            error_count = error_count + 1;
+            $display("FAIL  V1: B's refill data wrong after eviction (expected %h got %h)",
+                     sdram_line_dw0(ADDR_B_EV), dcache_rsp.rdata);
+        end else begin
+            $display("PASS  V1: dirty eviction completed, B served (rdata=%h)", dcache_rsp.rdata);
+        end
+        dcache_req.valid = 1'b0;
+        repeat (2) @(posedge clk);
+
+        // 3. Load A again: it was evicted in step 2, so this misses again
+        //    (victim = way 1, the clean filler — no writeback) and must
+        //    read back the line written back in step 2: dw0 = STORE_VAL.
+        dcache_req.valid = 1'b1;
+        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_A_EV};
+        wait_rsp         = 0;
+        while (!dcache_rsp.rvalid && wait_rsp < 60) begin
+            @(posedge clk);
+            wait_rsp = wait_rsp + 1;
+        end
+        if (!dcache_rsp.rvalid) begin
+            error_count = error_count + 1;
+            $display("FAIL  V2: re-load of evicted address 0x%0h never completed", ADDR_A_EV);
+        end else if (dcache_rsp.rdata !== STORE_VAL) begin
+            error_count = error_count + 1;
+            $display("FAIL  V2: evicted line lost/corrupted by writeback (expected %h got %h)",
+                     STORE_VAL, dcache_rsp.rdata);
+        end else begin
+            $display("PASS  V2: evicted line survived the writeback round-trip (rdata=%h)",
+                     dcache_rsp.rdata);
+        end
+        dcache_req.valid = 1'b0;
+        repeat (2) @(posedge clk);
+
+        // 4. dw1 of A: the store only touched dw0, so the rest of the line
+        //    must still be the preloaded pattern after both round-trips.
+        dcache_req.valid = 1'b1;
+        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_A_EV_DW1};
+        wait_rsp         = 0;
+        while (!dcache_rsp.rvalid && wait_rsp < 60) begin
+            @(posedge clk);
+            wait_rsp = wait_rsp + 1;
+        end
+        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_DW1) begin
+            error_count = error_count + 1;
+            $display(
+                "FAIL  V3: line's second doubleword wrong after round-trip (expected %h got %h)",
+                EXP_DW1, dcache_rsp.rdata);
+        end else begin
+            $display("PASS  V3: rest of line intact after round-trip (rdata=%h)", dcache_rsp.rdata);
+        end
+        dcache_req.valid  = 1'b0;
+
+        // 5. Store MISS (write-allocate): storing to a non-resident line
+        //    (tag 0x444, set 77) must refill, merge the store into the
+        //    line, and commit it DIRTY; a re-load returns the stored value.
+        dcache_req.valid  = 1'b1;
+        dcache_req.we     = 1'b1;
+        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_C_EV};
+        dcache_req.wdata  = STORE_VAL;
+        dcache_req.wstrb  = 8'h0F;  // only the low 4 bytes of doubleword 0
+        dcache_req.rready = 1'b1;
+        repeat (4) @(posedge clk);
+        dcache_req.valid = 1'b0;
+        dcache_req.we    = 1'b0;
+        wait_fsm         = 0;
+        while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[1]) && wait_fsm < 120) begin
+            @(posedge clk);  // let the write-allocate refill finish
+            wait_fsm = wait_fsm + 1;
+        end
+        repeat (4) @(posedge clk);  // drain leftovers (rready=1 pops them)
+
+        dcache_req.valid = 1'b1;
+        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_C_EV};
+        wait_rsp         = 0;
+        while (!dcache_rsp.rvalid && wait_rsp < 60) begin
+            @(posedge clk);
+            wait_rsp = wait_rsp + 1;
+        end
+        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== MERGE_VAL) begin
+            error_count = error_count + 1;
+            $display("FAIL  V4: write-allocated store-merge wrong (rvalid=%b expected %h got %h)",
+                     dcache_rsp.rvalid, MERGE_VAL, dcache_rsp.rdata);
+        end else begin
+            $display("PASS  V4: store miss write-allocated + merged (rdata=%h)", dcache_rsp.rdata);
         end
         dcache_req.valid = 1'b0;
 

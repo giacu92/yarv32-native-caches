@@ -71,16 +71,19 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   subfolder holds IP build logs/reports — do not hand-edit.
 - `sim/sim_top.sv` — Verilator testbench / sim top (clock, reset, drives
   the I/D-cache `mem_req_t` interfaces, dumps `sim_top.vcd`). Compiles with
-  `--timing`. Self-checking: phases A (I-hit way 0), D (response held with
-  `rready=0` + 2 outstanding I-port reads returned in order), E (I-hit on
-  way 1 alone — per-way comparator + hit-way data mux), F (simultaneous
-  I+D hits), B (I-miss), C (D-hit), H (D-miss with both ways valid, i.e.
-  the miss-detection half of an eviction) with PASS/FAIL counters,
-  expected-`rdata` checks on the hit phases, and a 300-cycle watchdog.
-  Miss phases run last: a miss wedges its port until the Phase-4 unstall
-  exists. Preloads the tag/data macros by hierarchical reference
-  (`u_dut.gen_way[w].u_itag.mem` etc.) at time 0, indexed by the plain set
-  index (the DUT applies the `TAG_BYTES_W` shift itself).
+  `--timing`. Self-checking phases with PASS/FAIL counters,
+  expected-`rdata` checks, and a watchdog: A (I-hit way 0), D (response
+  held with `rready=0` + 2 outstanding I-port reads returned in order), E
+  (I-hit on way 1 alone — per-way comparator + hit-way data mux), F
+  (simultaneous I+D hits), B (I-miss), M (the B miss completes: unstall
+  serves the refilled data, re-request hits), C (D-hit), H (D-miss with
+  both ways valid), S (posted store hit, read-back, neighboring doubleword
+  untouched), V (dirty eviction with both ways valid: round-robin victim,
+  writeback to the victim's address, evicted line survives the round-trip)
+  and V4 (store-miss write-allocate with a partial byte strobe merged
+  into the refilled line). Preloads the tag/data macros by hierarchical
+  reference (`u_dut.gen_way[w].u_itag.mem` etc.) at time 0, indexed by the
+  plain set index (the DUT applies the `TAG_BYTES_W` shift itself).
 - `sim/sdram_stub.sv` — behavioral replacement for `SDRAM_Controller_HS_Top`
   (identical port list). The real IP netlist (`.vo` Gowin primitives /
   encrypted `.vg`) is not Verilator-simulatable, so the sim file list
@@ -159,43 +162,33 @@ The bootrom is a 2 KiB (`ADDR_W=11`) read-only `native_ram` instance; its
 
 ## Current state / known TODOs
 
-The miss-handling FSM (`cache_cntrl.sv`, `S_IDLE` → `S_ARBITRATE` →
-`S_WB_REQ`/`S_WB_WAIT` → `S_REFILL_REQ`/`S_REFILL_WAIT` → `S_UPDATE_TAG`)
-is a skeleton. Hit *detection* is combinational (parallel tag compare) and
-never enters this FSM; only a miss triggers arbitration for the shared SDRAM
-controller (dcache wins ties, fixed priority). Open items, marked `TODO` in
-source:
+Hit *detection* is combinational (parallel tag compare) and never enters
+the FSM; only a miss triggers arbitration for the shared SDRAM controller
+(dcache wins ties, fixed priority). The miss FSM is COMPLETE end-to-end
+(TODO.md Phases 0–4 done): `S_IDLE` → `S_ARBITRATE` →
+(`S_WB_READ`/`S_WB_REQ`/`S_WB_WAIT` if the victim is dirty) →
+`S_REFILL_REQ`/`S_REFILL_WAIT` → `S_UPDATE_TAG` → `S_UNSTALL` → `S_IDLE`.
+Victim selection prefers an invalid way, else per-set round-robin
+(`rr_q`). Writeback streams the victim line straight off the data macro's
+registered output to the victim's address `{victim_tag, set, offset}`.
+`S_UPDATE_TAG` commits the refilled line (store-miss: write-allocate, the
+store bytes merged in, committed dirty) and writes the way's tag in one
+posted cycle; `S_UNSTALL` frees the missed skid slot, clears the queue
+block flags and pushes the load response in accept order — the port no
+longer wedges after a miss. D-cache store hits are posted writes through
+the byte-strobe mux into the hit way plus a tag dirty-bit set. Remaining
+open items, marked `TODO` in source:
 
 - SDRAM HS IP `sdrc_cmd` encoding not yet confirmed against IP
-  documentation (currently placeholder values).
+  documentation (currently placeholder values shared with `sdram_stub`).
 - `sdrc_addr` bank/row/col mapping not implemented (currently a naive
   address slice).
-- Victim way selection (LRU / round-robin per set) not implemented —
-  `victim_dirty_q` is unconnected.
-- `S_UPDATE_TAG` does not yet drive `itag_req`/`dtag_req` (way-indexed
-  tag write) or `imem_req`/`dmem_req` (line commit), and does not unstall
-  `icache_rsp_o`/`dcache_rsp_o`.
-- Cache data path (`imem_req[w]`/`dmem_req[w]`) is wired to the RAM
-  macros; hit-store `wstrb` muxing is still TODO (`wstrb` tied to 0 in the
-  speculative-read block). Hit responses are captured at the tag-answer
-  cycle off the RAW macro outputs (`imem_rsp_d`/`dmem_rsp_d`).
-- `icache_rsp_o`/`dcache_rsp_o` (TODO.md Phase 3 done): requests go through
-  a 2-slot registered skid per cache (`skid_q`); lookups fire once per
-  request off the registered slot address, and the compare context
-  (`cmp_tag_q`/`cmp_dw_sel_q`/`cmp_we_q`) is registered at launch so
-  back-to-back lookups cannot cross-compare. Hit data (hit-way mux + 64-bit
-  doubleword select by `addr[NBIT_OFFSET-1:3]`) is pushed onto a per-cache
-  response queue; `rvalid` is a LEVEL held until `rready` pops the head.
-  `wready = outstanding < SKID_DEPTH[c]` where outstanding counts occupied
-  skid slots plus unconsumed queue entries: 2 for the I-port (fetch unit's
-  2 outstanding reads, in-order delivery — entries pushed while an older
-  miss was unresolved are blocked behind it, `rq_blk_q`), 1 for the
-  single-outstanding D-port. Hits are served while the miss FSM is
-  mid-transit. A miss keeps its skid slot occupied (`slot_miss_q`) and
-  still never unstalls the requester (TODO.md Phase 4).
 - `S_WB_WAIT` keys its completion off `sdrc_init_done` (a placeholder, not
   a real write-completion signal); `S_REFILL_WAIT` assumes one 32-bit word
-  per cycle with no per-word data-valid strobe.
+  per cycle with no per-word data-valid strobe. Both deferred to TODO.md
+  Phase 5 (real IP protocol still unknown).
+- The bootrom `bootr_req`/`bootr_rsp` are undriven (no CPU-side fetch mux
+  yet).
 
 ## Completion plan
 
@@ -298,13 +291,14 @@ Each phase keeps `make sim` green and `make format-check` clean.
 
 ### Key context
 
-The sim currently passes only because Verilator is 2-state (zeroes the
-unreset `victim_dirty_q`), the stub ignores `sdrc_dqm` and mirrors the
-placeholder command encodings. Since the Phase-0 regression fixes
-(2026-08-31) the testbench also checks `rdata` on the hit phases and
-exercises the tag comparator on the miss, but it still waits 5 cycles per
-phase, drives only set 0/13, and never tests stores, evictions, or the
-miss-refill datapath — TODO.md Phase 7 covers the BFM-based hardening.
+The sim still cannot catch everything: the stub ignores `sdrc_dqm` and
+mirrors the placeholder command encodings, so a wrong encoding against the
+real IP stays invisible until Phase 5. Since the Phase-4 completion
+(2026-08-31) the testbench covers stores, dirty eviction with writeback
+round-trip, and write-allocate merge, but its settle loops key off
+hierarchical `state_q`/`slot_miss_wait` taps, drive only sets 0/13/40/41/77,
+and use no randomized traffic — TODO.md Phase 7 covers the BFM-based
+hardening and cosim.
 
 ## Tooling
 

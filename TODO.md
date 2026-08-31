@@ -123,31 +123,44 @@ All items completed 2026-08-31; `make sim` green, `make format-check` clean.
   writeback, line commit, unstall) is Phase 4 and NOT testable yet, so the
   miss phases run last (they wedge their port until the unstall exists).
 
-## Phase 4 — Miss FSM completion (writeback = the "wb" in wb cache)
+## Phase 4 — Miss FSM completion (writeback = the "wb" in wb cache) — DONE (2026-08-31)
 
-- [ ] Victim selection: round-robin per set is enough for `N_WAY=2`; latch
-  victim way, victim tag, `victim_dirty_q` (and reset it — X-propagates
-  outside Verilator).
-- [ ] Writeback: read the victim way's line into a dedicated `wb_buf`, burst
-  it to `{victim_tag, set_idx, offset}` — **not** `line_buf_q`/`miss_addr_q`
-  (today's code would overwrite the missing line's own SDRAM location,
-  losing the victim).
-- [ ] `S_UPDATE_TAG`: way-indexed tag write (`we=1`,
-  `addr=set_idx<<TAG_BYTES_W`, `wdata={tag, dirty, valid}`), line commit of
-  `line_buf_q` with full strobe, then unstall the requester and return to
-  `S_IDLE`. Unstall = clear `slot_miss_q` on the missed slot (frees the
-  outstanding unit and unblocks the queue) + replay the slot's request or
-  push its response directly, and clear `rq_blk_q` on entries that were
-  latched blocked behind this miss. Watch the macro read/write hazard: the
-  line-commit/tag writes collide with lookups launched under the Phase-3
-  hit-under-miss `wready` (Gowin BSRAM read-first behavior needed, or gate
-  lookups during commit).
-- [ ] D-cache store path: byte-strobe muxing into the hit way's data macro
-  on a write-hit, set dirty; decide write-allocate vs write-around for
-  store misses (write-allocate recommended for a writeback cache).
+- [x] Victim selection: prefer an invalid way, else per-set round-robin
+  pointer `rr_q[c][set]` (toggled on every miss, enough for `N_WAY=2`).
+  Victim way/tag/valid/dirty are captured per-slot at the miss pulse
+  (`victim_way_q`/`victim_valid_q`/`victim_dirty_q`/`victim_tag_q`,
+  reset like all flops).
+- [x] Writeback: the victim line is streamed straight from the data macro's
+  registered `rdata_q` output (`fsm_victim_line`) — no `wb_buf` copy needed
+  because the lookup gate (`fsm_lookup_gate`) holds the macro still during
+  `S_WB_READ`→`S_WB_WAIT`. The burst goes to the VICTIM's address
+  `{victim_tag, set, 5'h0}` — not `miss_addr_q` (which would clobber the
+  missing line's own SDRAM location, losing the victim).
+- [x] `S_UPDATE_TAG` → new `S_UNSTALL` state: one-cycle posted line commit
+  (full strobe) + way-indexed tag write (`addr = set << TAG_BYTES_W`,
+  `wdata = {tag, dirty, valid}`), both accepted at the same edge. Unstall
+  frees the missed skid slot, clears `slot_miss_q` and `rq_blk_q`, and for a
+  load pushes the refilled doubleword into the response queue in accept
+  order (4-way: pop / unblocked-head / blocked-head / empty queue); a store
+  gets no response (posted, write-allocated dirty). Lookups are gated only
+  for the FSM-owned cache during `S_WB_READ`/`S_WB_REQ`/`S_WB_WAIT`/
+  `S_UPDATE_TAG` — hit-under-miss survives the refill; the D-port store-hit
+  path and the FSM writes are mutually exclusive (single-outstanding D).
+- [x] D-cache store path: store-hit writes the hit way's data macro with
+  the byte-strobe positioned by `cmp_dw_sel_q` and sets the tag's dirty bit
+  in the same cycle (posted). Store misses are WRITE-ALLOCATE: the refill
+  is merged with the store bytes (`commit_line`) and committed DIRTY.
 - [ ] Replace `S_WB_WAIT`'s `sdrc_init_done` placeholder with a real
   write-completion signal; qualify `S_REFILL_WAIT` word captures with a real
-  per-word data-valid strobe.
+  per-word data-valid strobe — **deferred to Phase 5**: both depend on the
+  real Gowin HS IP protocol, still unknown (command encodings are
+  placeholders the stub merely mirrors).
+- [x] Sim: Phase M (B's miss completes, unstall serves the refill, the
+  re-request hits), Phase S (posted store hit, read-back, neighboring
+  doubleword untouched), Phase V (dirty eviction with both ways valid:
+  round-robin victim, writeback lands at the victim's address, evicted line
+  survives the round-trip, rest of line intact) and Phase V4 (store-miss
+  write-allocate: partial-strobe store merged into the refilled line).
 
 ## Phase 5 — Real SDRAM IP integration (Gowin HS)
 
