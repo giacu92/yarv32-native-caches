@@ -9,6 +9,11 @@ import yarv32_cache_pkg::*;
  * I-Cache size: 8 KiB - D-Cache size: 8 KiB = 16 KiB total
  * 8 MiB SDRAM (GW2AR Internal) --> Address is 23 bit wide
  *
+ * HASH_INDEX = 0 : classic bit-slice set index
+ *                  addr = {tag, set_idx, offset}
+ * HASH_INDEX = 1 : hashed set index (cache_set_hash in yarv32_cache_pkg)
+ *                  tag stores the full block address (no false hits)
+ *
  * Naming: ports use *_i/_o; internals no prefix; flops _q.
  */
 
@@ -20,7 +25,9 @@ module cache_cntrl #(
     // Number of way (caches are set-associative)
     parameter int N_WAY = 2,
     // Cache width in bits (depth = 2^CACHE_SIZE bytes). Both have same size
-    parameter int CACHE_SIZE = 13  // 2^13 = 8 KiB
+    parameter int CACHE_SIZE = 13,  // 2^13 = 8 KiB
+    // 0 = classic index, 1 = hashed index (see cache_set_hash in package)
+    parameter bit HASH_INDEX = 1'b1
 ) (
     input wire clk_i,
     input wire rstn_i,
@@ -62,8 +69,11 @@ module cache_cntrl #(
     // NBIT_SET_IDX: 128 sets --> 7 bit
     localparam int NBIT_SET_IDX = $clog2(N_SETS);
 
-    // NBIT_TAG: 11 bit + valid + dirty
-    localparam int NBIT_TAG = (MEM_SIZE - NBIT_SET_IDX - NBIT_OFFSET) + 2;
+    // Classic: leftover high bits after {set, offset} + valid + dirty
+    // Hashed : full block address (addr without offset) + valid + dirty
+    //          because the set index is no longer a bit-slice of the address
+    localparam int NBIT_TAG = HASH_INDEX ?
+        ((MEM_SIZE - NBIT_OFFSET) + 2) : ((MEM_SIZE - NBIT_SET_IDX - NBIT_OFFSET) + 2);
 
     // TAG_DATA_W: Round up to the next multiple of 8 (byte-aligned)
     localparam int TAG_DATA_W = ((NBIT_TAG + 7) / 8) * 8;
@@ -276,22 +286,33 @@ module cache_cntrl #(
     );
 
 
-
-
     // ===================================================================
     // TODO: Cache controller logic (hit/miss, refill, write-back, arbitration)
     // ===================================================================
     // Address split + tag RAM read wiring + hit comparison are in place.
     // Refill/write-back FSM still to be added.
 
-    // Address split per cache (see N_CACHE above): offset, set index, tag
-    // and intra-line word index from each cache's request address.
+    // Address split per cache. generate-if so only one branch is elaborated:
+    // HASH_INDEX changes TAG_FIELD_W, and a runtime if would width-mismatch.
     generate
-        for (w = 0; w < N_CACHE; w++) begin : gen_addr_split
-            assign offset[w]  = cache_req[w].addr[NBIT_OFFSET-1:0];
-            assign set_idx[w] = cache_req[w].addr[NBIT_OFFSET+:NBIT_SET_IDX];
-            assign tag[w]     = cache_req[w].addr[MEM_SIZE-1:NBIT_OFFSET+NBIT_SET_IDX];
-            assign mask[w]    = offset[w][NBIT_OFFSET-1:2];
+        if (HASH_INDEX) begin : g_hash_index
+            always_comb begin
+                for (int c = 0; c < N_CACHE; c++) begin
+                    offset[c]  = cache_req[c].addr[NBIT_OFFSET-1:0];
+                    set_idx[c] = cache_set_hash(cache_req[c].addr[MEM_SIZE-1:0]);
+                    tag[c]     = cache_req[c].addr[MEM_SIZE-1:NBIT_OFFSET];
+                    mask[c]    = offset[c][NBIT_OFFSET-1:2];
+                end
+            end
+        end else begin : g_classic_index
+            always_comb begin
+                for (int c = 0; c < N_CACHE; c++) begin
+                    offset[c]  = cache_req[c].addr[NBIT_OFFSET-1:0];
+                    set_idx[c] = cache_req[c].addr[NBIT_OFFSET+:NBIT_SET_IDX];
+                    tag[c]     = cache_req[c].addr[MEM_SIZE-1-:TAG_FIELD_W];
+                    mask[c]    = offset[c][NBIT_OFFSET-1:2];
+                end
+            end
         end
     endgenerate
 
@@ -352,7 +373,7 @@ module cache_cntrl #(
         for (int i = 0; i < N_WAY; i++) begin
             imem_req[i]        = '0;
             imem_req[i].valid  = icache_req_i.valid;
-            imem_req[i].we     = 1'b0;  // lookup only, imem write handled by refill FSM         
+            imem_req[i].we     = 1'b0;  // lookup only, imem write handled by refill FSM
             imem_req[i].wstrb  = '0;  // lookup only, wstrb muxing for hits is TODO
             imem_req[i].addr   = icache_req_i.addr;
             imem_req[i].rready = 1'b1;
@@ -517,12 +538,45 @@ module cache_cntrl #(
                 // TODO: drive itag_req/dtag_req (we=1, addr=set_idx<<TAG_BYTES_W,
                 // wdata={tag,dirty=0,valid=1}) and imem_req/dmem_req to commit
                 // line_buf_q, then unstall the requester (icache_rsp_o/dcache_rsp_o).
+                // Tag field width is TAG_FIELD_W (11 classic / 18 hashed).
                 state_d = S_IDLE;
             end
 
             default: state_d = S_IDLE;
         endcase
     end
+
+    // -------------------------------------------------------------
+    // CPU-facing response: hit-way line mux + 32-bit word select
+    // -------------------------------------------------------------
+    // imem_rsp_q/dmem_rsp_q each hold one full 256-bit line per way; the
+    // winning way is the one whose tag hit (registered, same pipeline stage
+    // as the data). The requested 32-bit word inside that line is selected
+    // by the intra-line word offset (mask, i.e. addr[NBIT_OFFSET-1:2]).
+    // TODO: rdata is MEM_WIDTH=64 bits but the select granularity is 32 bits;
+    // 64-bit CPU accesses need a doubleword select (addr[NBIT_OFFSET-1:3]).
+    logic [DATA_WIDTH-1:0] icache_line, dcache_line;
+
+    always_comb begin
+        icache_line = '0;
+        dcache_line = '0;
+        for (int i = 0; i < N_WAY; i++) begin
+            if (icache_way_hit_q[i]) icache_line = imem_rsp_q[i].rdata;
+            if (dcache_way_hit_q[i]) dcache_line = dmem_rsp_q[i].rdata;
+        end
+    end
+
+    // wready: cache accepts a new CPU request only while the miss FSM is idle
+    // (hit path needs no FSM cycles; a miss stalls the requester).
+    assign icache_rsp_o.wready = (state_q == S_IDLE);
+    assign icache_rsp_o.rvalid = imem_rsp_q[0].rvalid && (|icache_way_hit_q);
+    assign icache_rsp_o.rdata  = icache_line[icache_word_sel_q*64+:64];
+    assign icache_rsp_o.bvalid = 1'b0;  // posted stores, no B channel
+
+    assign dcache_rsp_o.wready = (state_q == S_IDLE);
+    assign dcache_rsp_o.rvalid = dmem_rsp_q[0].rvalid && (|dcache_way_hit_q);
+    assign dcache_rsp_o.rdata  = icache_line[dcache_word_sel_q*64+:64];
+    assign dcache_rsp_o.bvalid = 1'b0;  // posted stores, no B channel
 
 `ifdef VERILATOR
     logic                  icache_req_valid;
@@ -569,42 +623,16 @@ module cache_cntrl #(
     assign imem0_rsp_q_rdata  = imem_rsp_q[0].rdata;
     assign imem0_rsp_q_bvalid = imem_rsp_q[0].bvalid;
 
-
+    logic        icache0_rsp_o_wready;
+    logic        icache0_rsp_o_rvalid;
+    logic [63:0] icache0_rsp_o_rdata;
+    logic        icache0_rsp_o_bvalid;
+    assign icache0_rsp_o_wready = icache_rsp_o.wready;
+    assign icache0_rsp_o_rvalid = icache_rsp_o.rvalid;
+    assign icache0_rsp_o_rdata  = icache_rsp_o.rdata;
+    assign icache0_rsp_o_bvalid = icache_rsp_o.bvalid;
 
 `endif
-
-    // -------------------------------------------------------------
-    // CPU-facing response: hit-way line mux + 32-bit word select
-    // -------------------------------------------------------------
-    // imem_rsp_q/dmem_rsp_q each hold one full 256-bit line per way; the
-    // winning way is the one whose tag hit (registered, same pipeline stage
-    // as the data). The requested 32-bit word inside that line is selected
-    // by the intra-line word offset (mask, i.e. addr[NBIT_OFFSET-1:2]).
-    // TODO: rdata is MEM_WIDTH=64 bits but the select granularity is 32 bits;
-    // 64-bit CPU accesses need a doubleword select (addr[NBIT_OFFSET-1:3]).
-    logic [DATA_WIDTH-1:0] icache_line, dcache_line;
-
-    always_comb begin
-        icache_line = '0;
-        dcache_line = '0;
-        for (int i = 0; i < N_WAY; i++) begin
-            if (icache_way_hit_q[i]) icache_line = imem_rsp_q[i].rdata;
-            if (dcache_way_hit_q[i]) dcache_line = dmem_rsp_q[i].rdata;
-        end
-    end
-
-    // wready: cache accepts a new CPU request only while the miss FSM is idle
-    // (hit path needs no FSM cycles; a miss stalls the requester).
-    assign icache_rsp_o.wready = (state_q == S_IDLE);
-    assign icache_rsp_o.rvalid = imem_rsp_q[0].rvalid && (|icache_way_hit_q);
-    assign icache_rsp_o.rdata  = {32'd0, icache_line[icache_word_sel_q*32+:32]};
-    assign icache_rsp_o.bvalid = 1'b0;  // posted stores, no B channel
-
-    assign dcache_rsp_o.wready = (state_q == S_IDLE);
-    assign dcache_rsp_o.rvalid = dmem_rsp_q[0].rvalid && (|dcache_way_hit_q);
-    assign dcache_rsp_o.rdata  = {32'd0, dcache_line[dcache_word_sel_q*32+:32]};
-    assign dcache_rsp_o.bvalid = 1'b0;  // posted stores, no B channel
-
 
 endmodule
 

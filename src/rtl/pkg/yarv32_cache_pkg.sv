@@ -56,6 +56,28 @@ package yarv32_cache_pkg;
     // Native protocol, cache-line width: cache data macros.
     `YARV_MEM_TYPES(cache_req_t, cache_rsp_t, MEM_WIDTH, CACHE_WIDTH)
 
+    function automatic logic [6:0] cache_set_hash(
+        input logic [22:0] addr  // indirizzo a 23 bit (spazio 8 MiB)
+            );
+        localparam int OFFSET_BITS = 5;  // 32-byte block
+        localparam int SET_BITS = 7;  // 128 set
+
+        logic [17:0] block_addr;  // addr senza i 5 bit di offset
+        logic [ 6:0] h;
+
+        block_addr = addr[22:OFFSET_BITS];  // 18 bit
+
+        // Mixing aggressivo anche sui bit bassi
+        h          = block_addr[6:0];  // [6:0]
+        h ^= block_addr[9:3];  // >> 3
+        h ^= block_addr[13:7];  // >> 7
+        h ^= block_addr[17:11];  // >> 11
+        h ^= {3'b0, block_addr[17:14]};
+        h ^= block_addr[8:2];  // >> 2
+
+        return h;  // già su 7 bit
+    endfunction
+
 endpackage
 
 `resetall

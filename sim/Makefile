@@ -12,6 +12,7 @@
 
 VERILATOR ?= verilator
 GTKWAVE   ?= gtkwave
+HASH_INDEX ?= 1
 
 TOP       := sim_top
 VTOP      := obj_dir/V$(TOP)
@@ -36,6 +37,7 @@ SIM_RTL   := sdram_stub.sv sim_top.sv
 VFLAGS    := --binary --timing --trace \
              -Wno-UNUSED -Wno-CASEINCOMPLETE \
              -Wno-UNOPTFLAT -Wno-INITIALDLY -Wno-MULTIDRIVEN \
+			 -GHASH_INDEX=$(HASH_INDEX) \
              --top-module $(TOP) -Mdir obj_dir
 
 .PHONY: run build wave clean
