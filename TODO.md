@@ -215,8 +215,14 @@ Follow-ups (open):
 ## Phase 6 — FPGA build for Tang Nano 20K
 
 - [ ] Create the Gowin project/constraints: target `GW2AR-LV18QN88C8/I7`
-  (QFN88), `gw2ar18c-000` speed grade, Tang Nano 20K pinout constraint file
-  (`.cst`) — clocks, reset, SDRAM pins per board schematic.
+  (QFN88), `gw2ar18c-000` speed grade, Tang Nano 20K constraint file
+  (`.cst`) — clocks, reset, LEDs. NOTE: the embedded SDRAM is SIP — it
+  gets NO `.cst` entries; the toolchain connects it automatically when the
+  FPGA top-level ports use the fixed names `O_sdram_clk`, `O_sdram_cke`,
+  `O_sdram_cs_n`, `O_sdram_cas_n`, `O_sdram_ras_n`, `O_sdram_wen_n`,
+  `O_sdram_dqm`, `O_sdram_addr`, `O_sdram_ba`, `IO_sdram_dq` — so the
+  cache subsystem needs an FPGA top wrapper exposing exactly those names
+  (cache_cntrl's own ports are `sdram_*_o`, close but not identical).
 - [ ] Resource sanity: 2 × 8 KiB cache = data macros 2 KiB/way (2 ×
   18 kb BSRAM blocks per way at 256-bit width), tag macros (4 × 16-bit
   words × 128 sets — trivial), plus I/O and SDRAM controller. Check the
