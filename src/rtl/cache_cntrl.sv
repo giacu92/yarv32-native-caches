@@ -36,11 +36,8 @@ module cache_cntrl #(
     input  mem_req_t dcache_req_i,
     output mem_rsp_t dcache_rsp_o,
 
-    // SDRAM Interface (external pins)
-    input  wire        sdram_clk_i,    // I_sdram_clk
-    input  wire        sdrc_clk_i,     // I_sdrc_clk
-    input  wire        sdrc_rst_n_i,   // I_sdrc_rst_n
-    output wire        sdram_clk_o,    // O_sdram_clk
+    // SDRAM Interface (external pins, driven by the internal sdram_controller)
+    output wire        sdram_clk_o,    // SDRAM clock (TODO: PLL phase shift for the FPGA)
     output wire        sdram_cke_o,    // O_sdram_cke
     output wire        sdram_cs_n_o,   // O_sdram_cs_n
     output wire        sdram_cas_n_o,  // O_sdram_cas_n
@@ -143,21 +140,18 @@ module cache_cntrl #(
     tag_req_t dtag_req[N_WAY];  // towards dtag ways
     tag_rsp_t dtag_rsp[N_WAY];  // from dtag ways
 
-    // SDRAM command interface
-    logic sdrc_cmd_en;
-    logic [2:0] sdrc_cmd;
-    logic sdrc_precharge_ctrl;
-    logic sdram_power_down;
-    logic sdram_selfrefresh;
-    logic [20:0] sdrc_addr;
-    logic [3:0] sdrc_dqm;
-    logic [31:0] sdrc_data;
-    logic [7:0] sdrc_data_len;
-
-    // SDRAM status outputs (internal)
-    logic [31:0] sdrc_data_out;
-    logic sdrc_init_done;
-    logic sdrc_cmd_ack;
+    // SDRAM controller host interface (sdram_controller, src/ips submodule):
+    // one 32-bit word per transaction, accepted in IDLE (busy rises one
+    // cycle after the accept edge); a read completes with a one-cycle
+    // rd_ready pulse carrying rd_data, a write completes when busy falls.
+    logic sdram_rd_en;
+    logic sdram_wr_en;
+    logic sdram_busy;
+    logic sdram_rd_ready;
+    logic [20:0] sdram_rd_addr;  // 32-bit word address {bank, row, col}
+    logic [20:0] sdram_wr_addr;
+    logic [31:0] sdram_rd_data;
+    logic [31:0] sdram_wr_data;
 
     // Per-cache request skid, slot-indexed (freed slots are reused as a
     // free list; at most one slot is ever un-launched, so launch order =
@@ -429,41 +423,46 @@ module cache_cntrl #(
         end
     endgenerate
 
-    // SDRAM Controller instance
-    SDRAM_Controller_HS_Top u_sdram_cntrl (
-        .O_sdram_clk          (sdram_clk_o),
-        .O_sdram_cke          (sdram_cke_o),
-        .O_sdram_cs_n         (sdram_cs_n_o),
-        .O_sdram_cas_n        (sdram_cas_n_o),
-        .O_sdram_ras_n        (sdram_ras_n_o),
-        .O_sdram_wen_n        (sdram_wen_n_o),
-        .O_sdram_dqm          (sdram_dqm_o),
-        .O_sdram_addr         (sdram_addr_o),
-        .O_sdram_ba           (sdram_ba_o),
-        .IO_sdram_dq          (sdram_dq_io),
-        .I_sdrc_rst_n         (sdrc_rst_n_i),
-        .I_sdrc_clk           (sdrc_clk_i),
-        .I_sdram_clk          (sdram_clk_i),
-        .I_sdrc_cmd_en        (sdrc_cmd_en),
-        .I_sdrc_cmd           (sdrc_cmd),
-        .I_sdrc_precharge_ctrl(sdrc_precharge_ctrl),
-        .I_sdram_power_down   (sdram_power_down),
-        .I_sdram_selfrefresh  (sdram_selfrefresh),
-        .I_sdrc_addr          (sdrc_addr),
-        .I_sdrc_dqm           (sdrc_dqm),
-        .I_sdrc_data          (sdrc_data),
-        .I_sdrc_data_len      (sdrc_data_len),
-        .O_sdrc_data          (sdrc_data_out),
-        .O_sdrc_init_done     (sdrc_init_done),
-        .O_sdrc_cmd_ack       (sdrc_cmd_ack)
+    // SDRAM controller (src/ips/sdram-controller submodule, BSD; the
+    // gw2ar-32bit branch adapts it to the GW2AR-18 embedded SDRAM: 32-bit
+    // data, row/col/bank 11/8/2, CL=3, burst length 1 with auto-precharge
+    // — one host word per transaction, refresh handled internally).
+    // TODO (FPGA): pick the real system clock + CLK_FREQUENCY (refresh
+    // spacing) and the O_sdram_clk phase alignment.
+    sdram_controller #(
+        .ROW_WIDTH    (11),
+        .COL_WIDTH    (8),
+        .BANK_WIDTH   (2),
+        .DATA_WIDTH   (32),
+        .CLK_FREQUENCY(100)
+    ) u_sdram_cntrl (
+        .wr_addr     (sdram_wr_addr),
+        .wr_data     (sdram_wr_data),
+        .wr_enable   (sdram_wr_en),
+        .rd_addr     (sdram_rd_addr),
+        .rd_data     (sdram_rd_data),
+        .rd_ready    (sdram_rd_ready),
+        .rd_enable   (sdram_rd_en),
+        .busy        (sdram_busy),
+        .rst_n       (rstn_i),
+        .clk         (clk_i),
+        .addr        (sdram_addr_o),
+        .bank_addr   (sdram_ba_o),
+        .data        (sdram_dq_io),
+        .clock_enable(sdram_cke_o),
+        .cs_n        (sdram_cs_n_o),
+        .ras_n       (sdram_ras_n_o),
+        .cas_n       (sdram_cas_n_o),
+        .we_n        (sdram_wen_n_o),
+        .dqm         (sdram_dqm_o)
     );
 
+    assign sdram_clk_o = clk_i;
+
 
     // ===================================================================
-    // TODO: Cache controller logic (hit/miss, refill, write-back, arbitration)
+    // Cache controller logic (hit/miss, refill, write-back, arbitration)
     // ===================================================================
-    // Address split + tag RAM read wiring + hit comparison are in place.
-    // Refill/write-back FSM still to be added.
 
     // Address split per cache (classic bit-slice): addr = {tag, set, offset}.
     always_comb begin
@@ -787,8 +786,13 @@ module cache_cntrl #(
     // SDRAM address, refill the missing line, commit line + tag into the
     // victim way, then unstall the requester (free the slot, push the
     // response in accept order) and return to S_IDLE.
-    // Items marked TODO still need the Gowin SDRAM HS IP documentation
-    // (command encodings, address mapping, completion signals).
+    //
+    // SDRAM access model (sdram_controller host interface): one 32-bit
+    // word per transaction, no bursts. Refill = BURST_LEN single-word
+    // reads, writeback = BURST_LEN single-word writes. Handshake: an
+    // enable is held until busy rises (accept; refresh may delay it),
+    // a read completes on the rd_ready pulse, a write when busy falls —
+    // no placeholder completion signals.
 
     localparam int BURST_LEN = DATA_WIDTH / 32;  // 32-bit SDRAM data bus
 
@@ -796,10 +800,10 @@ module cache_cntrl #(
         S_IDLE,
         S_ARBITRATE,
         S_WB_READ,  // read the victim line out of its data macro
-        S_WB_REQ,  // writeback burst; skipped if victim not dirty
-        S_WB_WAIT,
-        S_REFILL_REQ,
-        S_REFILL_WAIT,
+        S_WB_ISSUE,  // writeback word handshake; skipped if victim not dirty
+        S_WB_WAIT,  // wait for the accepted write word to complete
+        S_REFILL_ISSUE,  // refill word read handshake
+        S_REFILL_WAIT,  // wait for rd_ready, capture the word
         S_UPDATE_TAG,  // commit line + tag into the victim way
         S_UNSTALL  // free the missed slot, deliver the response
     } fsm_state_e;
@@ -849,24 +853,34 @@ module cache_cntrl #(
         end
     end
 
+    // Line-aligned byte addresses: writeback targets the VICTIM's line
+    // {victim_tag, set, offset 0} — NOT the missing address (that would
+    // overwrite the missing line's own SDRAM location with victim data);
+    // refill reads the missing line itself. The controller's host address
+    // is the 32-bit word index {bank, row, col} = byte_addr[22:2], so the
+    // per-word index is the line base word + burst_cnt_q.
+    logic [22:0] wb_byte_addr, refill_byte_addr;
+    assign wb_byte_addr = {
+        victim_tag_q[req_sel_q][miss_slot_q],
+        miss_addr_q[NBIT_OFFSET+:NBIT_SET_IDX],
+        {NBIT_OFFSET{1'b0}}
+    };
+    assign refill_byte_addr = {miss_addr_q[MEM_SIZE-1:NBIT_OFFSET], {NBIT_OFFSET{1'b0}}};
+
     always_comb begin
         // defaults: hold state / datapath
-        state_d             = state_q;
-        req_sel_d           = req_sel_q;
-        burst_cnt_d         = burst_cnt_q;
-        line_buf_d          = line_buf_q;
-        miss_addr_d         = miss_addr_q;
-        miss_slot_d         = miss_slot_q;
+        state_d       = state_q;
+        req_sel_d     = req_sel_q;
+        burst_cnt_d   = burst_cnt_q;
+        line_buf_d    = line_buf_q;
+        miss_addr_d   = miss_addr_q;
+        miss_slot_d   = miss_slot_q;
 
-        sdrc_cmd_en         = 1'b0;
-        sdrc_cmd            = SDRC_CMD_NOP;  // encoding from yarv32_cache_pkg (see TODO there)
-        sdrc_addr           = '0;
-        sdrc_dqm            = 4'h0;  // all bytes enabled; the FSM never masks
-        sdrc_data           = '0;
-        sdrc_data_len       = '0;
-        sdrc_precharge_ctrl = 1'b0;
-        sdram_power_down    = 1'b0;
-        sdram_selfrefresh   = 1'b0;
+        sdram_rd_en   = 1'b0;
+        sdram_wr_en   = 1'b0;
+        sdram_wr_addr = wb_byte_addr[MEM_SIZE-1:2] + {17'd0, burst_cnt_q};
+        sdram_wr_data = fsm_victim_line[burst_cnt_q*32+:32];
+        sdram_rd_addr = refill_byte_addr[MEM_SIZE-1:2] + {17'd0, burst_cnt_q};
 
         unique case (state_q)
 
@@ -889,68 +903,65 @@ module cache_cntrl #(
                 // pulse (victim_*_q, per slot — see the skid block). Only a
                 // valid AND dirty victim needs its line written back before
                 // the refill overwrites the way.
+                burst_cnt_d = '0;
                 state_d = (victim_valid_q[req_sel_q][miss_slot_q] &&
-                           victim_dirty_q[req_sel_q][miss_slot_q]) ? S_WB_READ : S_REFILL_REQ;
+                           victim_dirty_q[req_sel_q][miss_slot_q]) ? S_WB_READ : S_REFILL_ISSUE;
             end
 
             S_WB_READ: begin
                 // The data-macro read of the victim line is driven by the
                 // FSM request mux (fsm_way_req): it launches this cycle and
-                // the data is valid from S_WB_REQ on, held in the macro's
+                // the data is valid from S_WB_ISSUE on, held in the macro's
                 // rdata_q (lookups are gated through S_WB_WAIT, so no other
                 // read can clobber it).
-                state_d = S_WB_REQ;
+                state_d = S_WB_ISSUE;
             end
 
-            S_WB_REQ: begin
-                sdrc_cmd_en = 1'b1;
-                sdrc_cmd = SDRC_CMD_WRITE;
-                // Writeback targets the VICTIM's line, {victim_tag, set,
-                // line-aligned offset} — NOT the missing address (that would
-                // overwrite the missing line's own SDRAM location with
-                // victim data). Word address = line byte base >> 2.
-                // TODO: bank/row/col mapping for the real IP.
-                sdrc_addr = {
-                    victim_tag_q[req_sel_q][miss_slot_q],
-                    miss_addr_q[NBIT_OFFSET+:NBIT_SET_IDX],
-                    {(NBIT_OFFSET - 2) {1'b0}}
-                };
-                sdrc_data = fsm_victim_line[burst_cnt_q*32+:32];
-                sdrc_data_len = BURST_LEN[7:0];
-                if (sdrc_cmd_ack) begin
-                    // Zero-extend so the 4-bit counter compares width-clean
-                    // against the 32-bit int localparam.
-                    if ({28'd0, burst_cnt_q} == BURST_LEN - 1) state_d = S_WB_WAIT;
-                    else burst_cnt_d = burst_cnt_q + 1'b1;
-                end
+            S_WB_ISSUE: begin
+                // Present the write word until the controller accepts it
+                // (busy rises a cycle after the accept edge; a due refresh
+                // delays the accept, so hold, don't pulse). Deassert on
+                // accept: an enable still up when the controller returns to
+                // IDLE would be latched as another request.
+                sdram_wr_en = !sdram_busy;
+                if (sdram_busy) state_d = S_WB_WAIT;
             end
 
             S_WB_WAIT: begin
-                // TODO: real completion condition (tWR / cmd_ack sequencing),
-                // sdrc_init_done is a placeholder only.
-                if (sdrc_init_done) begin
-                    burst_cnt_d = '0;
-                    state_d     = S_REFILL_REQ;
+                // The accepted word is done when busy falls (the controller
+                // sits in IDLE again). Advance to the next word, or to the
+                // refill once the whole line is out.
+                if (!sdram_busy) begin
+                    // Zero-extend so the 4-bit counter compares width-clean
+                    // against the 32-bit int localparam.
+                    if ({28'd0, burst_cnt_q} == BURST_LEN - 1) begin
+                        burst_cnt_d = '0;
+                        state_d     = S_REFILL_ISSUE;
+                    end else begin
+                        burst_cnt_d = burst_cnt_q + 1'b1;
+                        state_d     = S_WB_ISSUE;
+                    end
                 end
             end
 
-            S_REFILL_REQ: begin
-                sdrc_cmd_en   = 1'b1;
-                sdrc_cmd      = SDRC_CMD_READ;
-                // Line-aligned burst start, same as S_WB_REQ: the refill
-                // reads exactly the missing line, word 0 first.
-                // TODO: bank/row/col mapping for the real IP.
-                sdrc_addr     = {miss_addr_q[MEM_SIZE-1:NBIT_OFFSET], {(NBIT_OFFSET - 2) {1'b0}}};
-                sdrc_data_len = BURST_LEN[7:0];
-                if (sdrc_cmd_ack) state_d = S_REFILL_WAIT;
+            S_REFILL_ISSUE: begin
+                // Present the read word address until accepted (see
+                // S_WB_ISSUE on the hold-vs-pulse question).
+                sdram_rd_en = !sdram_busy;
+                if (sdram_busy) state_d = S_REFILL_WAIT;
             end
 
             S_REFILL_WAIT: begin
-                // TODO: qualify with the controller's per-word data-valid
-                // strobe instead of assuming one word per cycle.
-                line_buf_d[burst_cnt_q*32+:32] = sdrc_data_out;
-                if ({28'd0, burst_cnt_q} == BURST_LEN - 1) state_d = S_UPDATE_TAG;
-                else burst_cnt_d = burst_cnt_q + 1'b1;
+                // The controller's per-word data-valid strobe: rd_ready is a
+                // one-cycle pulse carrying the word on rd_data.
+                if (sdram_rd_ready) begin
+                    line_buf_d[burst_cnt_q*32+:32] = sdram_rd_data;
+                    if ({28'd0, burst_cnt_q} == BURST_LEN - 1) state_d = S_UPDATE_TAG;
+                    else begin
+                        burst_cnt_d = burst_cnt_q + 1'b1;
+                        state_d     = S_REFILL_ISSUE;
+                    end
+                end
             end
 
             S_UPDATE_TAG: begin
@@ -980,7 +991,7 @@ module cache_cntrl #(
     // -------------------------------------------------------------
 
     // Victim line as read back in S_WB_READ: held in the victim way's
-    // rdata_q through S_WB_REQ/S_WB_WAIT (lookups are gated, so no other
+    // rdata_q through S_WB_ISSUE/S_WB_WAIT (lookups are gated, so no other
     // read can overwrite it).
     assign fsm_victim_line = (req_sel_q == 1'b0) ? imem_rsp_d[fsm_victim_way].rdata :
         dmem_rsp_d[fsm_victim_way].rdata;
@@ -1078,11 +1089,11 @@ module cache_cntrl #(
 
     // Lookups on the cache the FSM is servicing are held while the FSM
     // touches its macros: S_WB_READ..S_WB_WAIT hold the victim line in the
-    // data macro's rdata_q, S_UPDATE_TAG commits the line+tag writes.
-    // S_REFILL_* leave the macros alone, so hits resume during the long
-    // refill phase.
+    // data macro's rdata_q (the writeback streams out of it word by word),
+    // S_UPDATE_TAG commits the line+tag writes. S_REFILL_* leave the macros
+    // alone, so hits resume during the long refill phase.
     logic fsm_macro_state;
-    assign fsm_macro_state = (state_q == S_WB_READ) || (state_q == S_WB_REQ) ||
+    assign fsm_macro_state = (state_q == S_WB_READ) || (state_q == S_WB_ISSUE) ||
         (state_q == S_WB_WAIT) || (state_q == S_UPDATE_TAG);
     assign fsm_lookup_gate[0] = fsm_macro_state && (req_sel_q == 1'b0);
     assign fsm_lookup_gate[1] = fsm_macro_state && (req_sel_q == 1'b1);

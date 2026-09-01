@@ -1,0 +1,3 @@
+[submodule "src/ips/sdram-controller"]
+	path = src/ips/sdram-controller
+	url = https://github.com/giacu92/sdram-controller.git

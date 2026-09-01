@@ -65,10 +65,17 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   field width, default `MEM_WIDTH`; the RAM decodes only the low `ADDR_W`
   bits), `READ_ONLY`, `INIT_FILE` (optional `$readmemh` preload, sim only),
   and `REQ_T`/`RSP_T` (protocol struct pair, see above).
-- `src/ips/sdram_controller_hs/` — Gowin SDRAM HS IP core (generated,
-  read-only): `.ipc`, `_tmp.v`, `.vo`. `CL=3`, `Data_Width=32`,
-  `Addr_Column_Width=8`, `Addr_Row_Width=11`, `Bank_Width=2`. The `temp/`
-  subfolder holds IP build logs/reports — do not hand-edit.
+- `src/ips/sdram-controller/` — git submodule of
+  `github.com/stffrdhrn/sdram-controller` (BSD), checked out on the local
+  branch `gw2ar-32bit` (adapts upstream's hardcoded 16-bit data to the
+  GW2AR-18 embedded SDRAM: `DATA_WIDTH` parameter, `dqm[3:0]` port,
+  zero-width-replication fixes, Verilator WIDTH-clean compares). Instantiated
+  inside `cache_cntrl`; geometry Row=11, Col=8, Bank=2, CL=3, BL=1, 32-bit
+  data = 8 MiB. Host interface: one 32-bit word per transaction,
+  `{bank,row,col}` word address = `byte[22:2]`, enable-held-until-busy
+  accept, `rd_ready` pulse per read word, busy fall ends a write. The
+  branch lives only on this machine until it is pushed to a fork (TODO.md
+  Phase 5 follow-up) — a fresh clone cannot fetch it until then.
 - `sim/sim_top.sv` — Verilator testbench / sim top (clock, reset, drives
   the I/D-cache `mem_req_t` interfaces, dumps `sim_top.vcd`). Compiles with
   `--timing`. Self-checking phases with PASS/FAIL counters,
@@ -84,15 +91,14 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   into the refilled line). Preloads the tag/data macros by hierarchical
   reference (`u_dut.gen_way[w].u_itag.mem` etc.) at time 0, indexed by the
   plain set index (the DUT applies the `TAG_BYTES_W` shift itself).
-- `sim/sdram_stub.sv` — behavioral replacement for `SDRAM_Controller_HS_Top`
-  (identical port list). The real IP netlist (`.vo` Gowin primitives /
-  encrypted `.vg`) is not Verilator-simulatable, so the sim file list
-  includes this stub instead of `src/ips/...`. Transactional model: 8 MiB
-  backing array, combinational `cmd_ack`, streams refill data one
-  32-bit word/cycle (matches the FSM's `S_REFILL_WAIT`). It uses the same
-  `SDRC_CMD_*` localparams as the FSM (shared via `yarv32_cache_pkg`), but
-  those values are *placeholders* pending the IP docs, so the sim
-  cannot catch a wrong command encoding against the real IP.
+- `sim/sdram_model.sv` — behavioral pin-level model of the GW2AR-18
+  embedded SDRAM (32-bit data, CL=3, BL=1, auto-precharge via A10, row-open
+  tracking per bank, MRS value check, 8 MiB backing array preloaded with
+  `32'hCAFE0000 | word_index[15:0]`). The REAL `sdram_controller` RTL runs
+  in the Verilator sim against it (the old `sdram_stub.sv` transactional
+  stub, which merely mirrored the FSM's own placeholder encodings, is
+  gone), so command encodings, ACT/precharge sequencing, and read timing
+  are verified end-to-end.
 
 ## Protocol: mem_req_t / mem_rsp_t
 
@@ -176,17 +182,18 @@ store bytes merged in, committed dirty) and writes the way's tag in one
 posted cycle; `S_UNSTALL` frees the missed skid slot, clears the queue
 block flags and pushes the load response in accept order — the port no
 longer wedges after a miss. D-cache store hits are posted writes through
-the byte-strobe mux into the hit way plus a tag dirty-bit set. Remaining
-open items, marked `TODO` in source:
+the byte-strobe mux into the hit way plus a tag dirty-bit set. The SDRAM
+side is the `sdram_controller` submodule (see Files): the miss FSM talks to
+its word-at-a-time host interface (`S_WB_ISSUE`/`S_REFILL_ISSUE` hold the
+enable until `busy` rises, writeback words complete on the busy fall,
+refill words are captured on the `rd_ready` pulse) — no placeholder
+completion signals. Remaining open items, marked `TODO` in source:
 
-- SDRAM HS IP `sdrc_cmd` encoding not yet confirmed against IP
-  documentation (currently placeholder values shared with `sdram_stub`).
-- `sdrc_addr` bank/row/col mapping not implemented (currently a naive
-  address slice).
-- `S_WB_WAIT` keys its completion off `sdrc_init_done` (a placeholder, not
-  a real write-completion signal); `S_REFILL_WAIT` assumes one 32-bit word
-  per cycle with no per-word data-valid strobe. Both deferred to TODO.md
-  Phase 5 (real IP protocol still unknown).
+- The `gw2ar-32bit` submodule branch is local-only until pushed to a fork
+  (TODO.md Phase 5 follow-up); upstream also lacks a LICENSE file.
+- FPGA clocking not decided: system clock frequency / `CLK_FREQUENCY`
+  (refresh spacing) and the `sdram_clk_o` phase alignment the embedded
+  SDRAM needs (today `sdram_clk_o = clk_i`).
 - The bootrom `bootr_req`/`bootr_rsp` are undriven (no CPU-side fetch mux
   yet).
 
@@ -291,14 +298,13 @@ Each phase keeps `make sim` green and `make format-check` clean.
 
 ### Key context
 
-The sim still cannot catch everything: the stub ignores `sdrc_dqm` and
-mirrors the placeholder command encodings, so a wrong encoding against the
-real IP stays invisible until Phase 5. Since the Phase-4 completion
-(2026-08-31) the testbench covers stores, dirty eviction with writeback
-round-trip, and write-allocate merge, but its settle loops key off
-hierarchical `state_q`/`slot_miss_wait` taps, drive only sets 0/13/40/41/77,
-and use no randomized traffic — TODO.md Phase 7 covers the BFM-based
-hardening and cosim.
+The sim now runs the real controller RTL against a pin-level SDRAM model
+(since the Phase-5 controller swap, 2026-09-02), so wrong command
+encodings or protocol violations are caught in `make sim` — but the
+testbench still has gaps: its settle loops key off hierarchical
+`state_q`/`slot_miss_wait` taps, drive only sets 0/13/40/41/77, and use no
+randomized traffic — TODO.md Phase 7 covers the BFM-based hardening and
+cosim.
 
 ## Tooling
 

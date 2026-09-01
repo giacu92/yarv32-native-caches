@@ -1,7 +1,8 @@
 # TODO — yarv32 native cache: path to working 2-way set-associative writeback cache on Tang Nano 20K
 
 Target: 2-way set-associative, writeback I/D cache backed by the GW2AR-18's
-embedded SDRAM (8 MiB, Gowin HS IP), bitstream for the Tang Nano 20K
+embedded SDRAM (8 MiB, raw pin interface — see Phase 5), bitstream for the
+Tang Nano 20K
 (GW2AR-LV18QN88C8/I7, QFN88). Ground rules for every phase: `make sim` green,
 `make format-check` clean.
 
@@ -150,11 +151,11 @@ All items completed 2026-08-31; `make sim` green, `make format-check` clean.
   the byte-strobe positioned by `cmp_dw_sel_q` and sets the tag's dirty bit
   in the same cycle (posted). Store misses are WRITE-ALLOCATE: the refill
   is merged with the store bytes (`commit_line`) and committed DIRTY.
-- [ ] Replace `S_WB_WAIT`'s `sdrc_init_done` placeholder with a real
+- [x] Replace `S_WB_WAIT`'s `sdrc_init_done` placeholder with a real
   write-completion signal; qualify `S_REFILL_WAIT` word captures with a real
-  per-word data-valid strobe — **deferred to Phase 5**: both depend on the
-  real Gowin HS IP protocol, still unknown (command encodings are
-  placeholders the stub merely mirrors).
+  per-word data-valid strobe — resolved by the Phase-5 controller swap
+  (2026-09-02): writeback words complete on the sdram_controller's busy
+  fall, refill words are captured on its rd_ready pulse.
 - [x] Sim: Phase M (B's miss completes, unstall serves the refill, the
   re-request hits), Phase S (posted store hit, read-back, neighboring
   doubleword untouched), Phase V (dirty eviction with both ways valid:
@@ -162,21 +163,60 @@ All items completed 2026-08-31; `make sim` green, `make format-check` clean.
   survives the round-trip, rest of line intact) and Phase V4 (store-miss
   write-allocate: partial-strobe store merged into the refilled line).
 
-## Phase 5 — Real SDRAM IP integration (Gowin HS)
+## Phase 5 — SDRAM controller integration — DONE (2026-09-02), follow-ups below
 
-- [ ] Confirm `sdrc_cmd` encodings against the Gowin HS IP documentation
-  (via the shared `SDRC_CMD_*` localparams); today they are placeholders the
-  stub merely mirrors.
-- [ ] Implement bank/row/col mapping for `sdrc_addr` (Bank_Width=2,
-  Row=11, Col=8, CL=3, 32-bit data). Today a naive address slice.
-- [ ] Verify against the real IP in the Gowin simulator (the `.vo` netlist
-  is not Verilator-simulatable; `sdram_stub.sv` is behavioral only).
+The Gowin HS IP was DROPPED (folder `src/ips/sdram_controller_hs` deleted,
+recoverable from git history): the core ships only encrypted (`.vg`) or as
+a non-Verilator-simulatable primitive netlist (`.vo`), the command
+encodings were unconfirmed placeholders the sim stub merely mirrored, and
+without IP docs on the build machine the Phase-5 verification items were
+unachievable. Replaced by **stffrdhrn/sdram-controller** (BSD), now a git
+submodule at `src/ips/sdram-controller`, branch `gw2ar-32bit`:
+
+- [x] Controller adaptation (submodule branch `gw2ar-32bit`):
+  `DATA_WIDTH` parameter (32 for the GW2AR-18 embedded SDRAM — upstream
+  hardcoded 16), `dqm[3:0]` port replacing the two 1-bit byte masks,
+  zero-width-replication fixes in the SDRAM address paths (upstream never
+  hits them at Row=13, Row=11 does), `CMD_MRS` x-bit cleaned, refresh
+  counter widened / explicit zero compares for Verilator WIDTH-cleanliness.
+- [x] Geometry: Row=11, Col=8, Bank=2, CL=3, BL=1, 32-bit data = 8 MiB;
+  host address is the 32-bit word index `{bank, row, col}` = `byte[22:2]`
+  — the bank/row/col mapping question is answered by construction (the
+  controller does the mapping; the FSM passes a plain word address).
+- [x] `cache_cntrl` miss-FSM reworked to the controller's host interface:
+  one 32-bit word per transaction (no bursts). `S_WB_ISSUE`/`S_REFILL_ISSUE`
+  hold `wr/rd_enable` until `busy` rises (refresh may delay the accept),
+  writeback words complete on the busy fall, refill words are captured on
+  the `rd_ready` pulse — no placeholder completion signals left.
+- [x] Sim: `sdram_stub.sv` (transactional HS-IP stub that mirrored the
+  FSM's own placeholder encodings) deleted; new `sim/sdram_model.sv` is a
+  behavioral pin-level SDRAM (CL=3, BL=1, auto-precharge, row-open
+  tracking, MRS value check). The REAL controller RTL now runs in the
+  Verilator sim against it, so command encodings, ACT/precharge
+  sequencing, and read timing are verified end-to-end, not mirrored.
+- [x] `make sim` green (all phases incl. dirty eviction + writeback
+  round-trip), `make format-check` clean.
+
+Follow-ups (open):
+
+- [ ] **Push the `gw2ar-32bit` branch**: fork
+  `stffrdhrn/sdram-controller` on GitHub, push the branch, point
+  `.gitmodules` at the fork (currently the URL is upstream's, so a fresh
+  clone cannot fetch the branch). Upstream has NO LICENSE file (BSD claim
+  only in the README) — add one in the fork.
+- [ ] FPGA clocking: pick the real system clock and `CLK_FREQUENCY`
+  (refresh spacing), and the `sdram_clk_o` phase alignment the embedded
+  SDRAM needs (today `sdram_clk_o = clk_i`, single clock domain).
+- [ ] Optional perf: BL=1 + auto-precharge costs ~10 cycles per word
+  (~80 cycles per line refill, ~160 with a dirty writeback). If that
+  starves the CPU, a burst-capable controller is the upgrade path
+  (revisit the Gowin HS IP once its docs are at hand, or extend upstream).
 
 ## Phase 6 — FPGA build for Tang Nano 20K
 
 - [ ] Create the Gowin project/constraints: target `GW2AR-LV18QN88C8/I7`
   (QFN88), `gw2ar18c-000` speed grade, Tang Nano 20K pinout constraint file
-  (`.cst`) — clocks, reset, SDRAM HS IP pins per board schematic.
+  (`.cst`) — clocks, reset, SDRAM pins per board schematic.
 - [ ] Resource sanity: 2 × 8 KiB cache = data macros 2 KiB/way (2 ×
   18 kb BSRAM blocks per way at 256-bit width), tag macros (4 × 16-bit
   words × 128 sets — trivial), plus I/O and SDRAM controller. Check the
@@ -185,9 +225,10 @@ All items completed 2026-08-31; `make sim` green, `make format-check` clean.
 - [ ] Add a `gw_sh` synthesis script target (`make fpga`) alongside the IDE
   flow; run GowinSynthesis + timing report, fix critical paths (the
   registered-request Phase-2 work exists for exactly this).
-- [ ] Timing constraints: SDRAM HS IP clock (needs its own PLL phase vs the
-  system clock per the IP docs), `set_false_path`/multicycle where the IP
-  requires it.
+- [ ] Timing constraints: `sdram_clk_o` phase alignment the embedded SDRAM
+  needs (today `sdram_clk_o = clk_i`; pick the PLL phase per the board
+  docs), `set_false_path`/multicycle where the SDRAM interface requires
+  it.
 - [ ] Board bring-up: minimal fetch loop through the bootrom, then LED/UART
   heartbeat driven by cache hits/misses before any CPU integration.
 

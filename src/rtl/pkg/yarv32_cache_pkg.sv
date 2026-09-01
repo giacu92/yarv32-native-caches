@@ -56,15 +56,6 @@ package yarv32_cache_pkg;
     // Native protocol, cache-line width: cache data macros.
     `YARV_MEM_TYPES(cache_req_t, cache_rsp_t, MEM_WIDTH, CACHE_WIDTH)
 
-    // SDRAM HS IP command encodings for I_sdrc_cmd. Shared by cache_cntrl's
-    // miss FSM and sim/sdram_stub.sv, so the two cannot diverge (a future
-    // re-encoding is a compile error, not a green sim over broken hardware).
-    // TODO: values are PLACEHOLDERS — confirm against the Gowin SDRAM HS IP
-    // documentation before synthesis (TODO.md Phase 5).
-    localparam logic [2:0] SDRC_CMD_NOP   = 3'b000;
-    localparam logic [2:0] SDRC_CMD_WRITE = 3'b001;
-    localparam logic [2:0] SDRC_CMD_READ  = 3'b010;
-
 endpackage
 
 `resetall

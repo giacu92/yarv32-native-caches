@@ -17,13 +17,15 @@ TOP       := sim_top
 VTOP      := obj_dir/V$(TOP)
 VCD       := sim_top.vcd
 
-# Sources: package first, then RTL, then the sim-only stub + testbench.
-# The SDRAM stub (sdram_stub.sv) defines SDRAM_Controller_HS_Top, which the
-# DUT instantiates by name — it REPLACES the non-simulatable Gowin IP, so
-# the real IP under src/ips/ is deliberately NOT on this list.
+# Sources: package first, then RTL, then the SDRAM controller (git
+# submodule, gw2ar-32bit branch — 32-bit adaptation of
+# github.com/stffrdhrn/sdram-controller), the behavioral SDRAM chip model,
+# and the testbench. The controller is real RTL driven on the raw SDRAM
+# pins, so the sim exercises the actual command encoding end-to-end.
 RTL_PKG   := ../src/rtl/pkg/yarv32_cache_pkg.sv
-RTL       := ../src/rtl/native_ram.sv ../src/rtl/cache_cntrl.sv
-SIM_RTL   := sdram_stub.sv sim_top.sv
+RTL       := ../src/rtl/native_ram.sv ../src/rtl/cache_cntrl.sv \
+             ../src/ips/sdram-controller/rtl/sdram_controller.v
+SIM_RTL   := sdram_model.sv sim_top.sv
 
 # --timing: enable # delays / event waits in the testbench.
 # --trace : enable $dumpfile/$dumpvars VCD output.

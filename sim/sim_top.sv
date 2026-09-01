@@ -45,16 +45,9 @@ module sim_top;
 
     logic clk;
     logic rstn;
-    logic sdram_clk;
-    logic sdrc_clk;
-    logic sdrc_rst_n;
 
     initial clk = 1'b0;
     initial forever #5 clk = ~clk;
-
-    assign sdram_clk  = clk;
-    assign sdrc_clk   = clk;
-    assign sdrc_rst_n = rstn;
 
     mem_req_t        icache_req;
     mem_rsp_t        icache_rsp;
@@ -79,9 +72,6 @@ module sim_top;
         .icache_rsp_o (icache_rsp),
         .dcache_req_i (dcache_req),
         .dcache_rsp_o (dcache_rsp),
-        .sdram_clk_i  (sdram_clk),
-        .sdrc_clk_i   (sdrc_clk),
-        .sdrc_rst_n_i (sdrc_rst_n),
         .sdram_clk_o  (sdram_clk_o),
         .sdram_cke_o  (sdram_cke_o),
         .sdram_cs_n_o (sdram_cs_n_o),
@@ -92,6 +82,24 @@ module sim_top;
         .sdram_addr_o (sdram_addr_o),
         .sdram_ba_o   (sdram_ba_o),
         .sdram_dq_io  (sdram_dq_io)
+    );
+
+    // Behavioral GW2AR embedded-SDRAM model on the raw pins: the real
+    // sdram_controller RTL (inside u_dut) drives it, so the command
+    // encoding, ACT/auto-precharge sequencing, and CL=3 read timing are
+    // all exercised end-to-end (the old sdram_stub only mirrored the
+    // FSM's own placeholder encodings).
+    sdram_model u_sdram (
+        .clk  (sdram_clk_o),
+        .cke  (sdram_cke_o),
+        .cs_n (sdram_cs_n_o),
+        .ras_n(sdram_ras_n_o),
+        .cas_n(sdram_cas_n_o),
+        .we_n (sdram_wen_n_o),
+        .dqm  (sdram_dqm_o),
+        .addr (sdram_addr_o),
+        .ba   (sdram_ba_o),
+        .dq   (sdram_dq_io)
     );
 
     // Geometry, derived exactly like cache_cntrl's localparams. Keep in
@@ -237,7 +245,7 @@ module sim_top;
         u_dut.gen_way[1].u_dcache.mem[set_of(ADDR_A_EV)] = LINE_PATTERN_W1;
     end
 
-    localparam int N_CYCLES = 800;
+    localparam int N_CYCLES = 4000;
     integer error_count;
     integer wait_rsp;
     integer wait_fsm;
@@ -439,7 +447,7 @@ module sim_top;
         // without re-entering the miss FSM.
         // ----
         wait_fsm = 0;
-        while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[0]) && wait_fsm < 120) begin
+        while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[0]) && wait_fsm < 400) begin
             @(posedge clk);  // let the Phase-B transit (and any duplicate
             // re-accepted request while valid was held) finish: the FSM
             // parks in S_IDLE for a cycle between back-to-back transits,
@@ -506,7 +514,7 @@ module sim_top;
         // and unstalls the port; the completion datapath is checked in M/V).
         // ----
         wait_fsm         = 0;
-        while (u_dut.state_q != 0 && wait_fsm < 60) begin
+        while (u_dut.state_q != 0 && wait_fsm < 400) begin
             @(posedge clk);  // let any in-flight FSM transit settle
             wait_fsm = wait_fsm + 1;
         end
@@ -542,7 +550,7 @@ module sim_top;
         // positioning at cmp_dw_sel_q).
         // ----
         wait_fsm         = 0;
-        while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[1]) && wait_fsm < 120) begin
+        while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[1]) && wait_fsm < 400) begin
             @(posedge clk);  // let the Phase-H transit (and any duplicate
             // re-accepted request while valid was held) finish
             wait_fsm = wait_fsm + 1;
@@ -628,7 +636,7 @@ module sim_top;
         dcache_req.valid = 1'b1;
         dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_B_EV};
         wait_rsp         = 0;
-        while (!dcache_rsp.rvalid && wait_rsp < 60) begin
+        while (!dcache_rsp.rvalid && wait_rsp < 400) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
         end
@@ -651,7 +659,7 @@ module sim_top;
         dcache_req.valid = 1'b1;
         dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_A_EV};
         wait_rsp         = 0;
-        while (!dcache_rsp.rvalid && wait_rsp < 60) begin
+        while (!dcache_rsp.rvalid && wait_rsp < 400) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
         end
@@ -674,7 +682,7 @@ module sim_top;
         dcache_req.valid = 1'b1;
         dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_A_EV_DW1};
         wait_rsp         = 0;
-        while (!dcache_rsp.rvalid && wait_rsp < 60) begin
+        while (!dcache_rsp.rvalid && wait_rsp < 400) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
         end
@@ -701,7 +709,7 @@ module sim_top;
         dcache_req.valid = 1'b0;
         dcache_req.we    = 1'b0;
         wait_fsm         = 0;
-        while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[1]) && wait_fsm < 120) begin
+        while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[1]) && wait_fsm < 400) begin
             @(posedge clk);  // let the write-allocate refill finish
             wait_fsm = wait_fsm + 1;
         end
@@ -710,7 +718,7 @@ module sim_top;
         dcache_req.valid = 1'b1;
         dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_C_EV};
         wait_rsp         = 0;
-        while (!dcache_rsp.rvalid && wait_rsp < 60) begin
+        while (!dcache_rsp.rvalid && wait_rsp < 400) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
         end
