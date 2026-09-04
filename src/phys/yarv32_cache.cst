@@ -1,0 +1,45 @@
+//
+// Physical constraints — yarv32 cache subsystem on the Sipeed Tang Nano 20K
+// Part: GW2AR-LV18QN88C8/I7 (GW2AR-18C, QFN88)
+//
+// The GW2AR-18's 8 MiB SDRAM is a SIP die, not board wiring: it gets NO
+// IO_LOC entries here. The toolchain connects it automatically to the
+// top-level ports named O_sdram_* / IO_sdram_dq (see fpga_top.sv) — those
+// names are the interface, so renaming a port silently disconnects it.
+//
+
+// 25 MHz reference clock from the MS5351M clock generator (crystal-fed).
+// CLK0 is routed to PIN10; used as a plain 3.3 V LVCMOS33 input (no
+// differential pair, no LVDS primitive, no external termination).
+IO_LOC "clk_i" 10;
+IO_PORT "clk_i" IO_TYPE=LVCMOS33 PULL_MODE=NONE BANK_VCCIO=3.3;
+
+// Board reset button S1. ACTIVE HIGH on this board: released = pin low =
+// run, held = pin high = reset (hence PULL_MODE=DOWN).
+IO_LOC "rst_i" 88;
+IO_PORT "rst_i" IO_TYPE=LVCMOS33 PULL_MODE=DOWN BANK_VCCIO=3.3;
+
+// Debug UART into the onboard BL616 USB-UART bridge (transmit only; the
+// design never reads the line, so RX is left unassigned).
+IO_LOC "uart_txd_o" 69;
+IO_PORT "uart_txd_o" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+
+// Status LEDs (active low — a lit LED is a 0 on the pin).
+//   led_o[0]   = self test failed
+//   led_o[1]   = self test passed
+//   led_o[2]   = self test running
+//   led_o[3]   = heartbeat
+//   led_o[5:4] = fail code: 00 none, 01 data mismatch, 10 D-port
+//                watchdog, 11 I-port watchdog
+IO_LOC "led_o[5]" 20;
+IO_PORT "led_o[5]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "led_o[4]" 19;
+IO_PORT "led_o[4]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "led_o[3]" 18;
+IO_PORT "led_o[3]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "led_o[2]" 17;
+IO_PORT "led_o[2]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "led_o[1]" 16;
+IO_PORT "led_o[1]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "led_o[0]" 15;
+IO_PORT "led_o[0]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;

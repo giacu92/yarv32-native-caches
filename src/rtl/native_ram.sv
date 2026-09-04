@@ -43,7 +43,9 @@ import yarv32_cache_pkg::*;
  *
  * Storage uses (* ram_style = "block" *) so Gowin infers a simple
  * dual-port BSRAM (one synchronous write port + one synchronous read
- * port, single clock). Byte-strobed writes use the BSRAM byte enables.
+ * port, single clock). Byte-strobed writes cost BSRAM blocks on this
+ * device (see BYTE_WRITE): Gowin has no byte write enable, so a
+ * byte-writable array is split into byte-wide blocks.
  * Storage contents are NOT reset (BSRAM has no clear); only the response
  * registers (rvalid_q) reset. Simulation preloads via INIT_FILE.
  *
@@ -60,6 +62,19 @@ module native_ram #(
     parameter int REQ_ADDR_W = MEM_WIDTH,
     // 1 = read-only I-mem (fetch); 0 = read/write D-mem (LSU, byte-strobed).
     parameter bit READ_ONLY = 0,
+    // 1 = per-byte write enables (wstrb selects which bytes commit).
+    // 0 = whole-word writes only; wstrb must be all ones on a write.
+    //
+    // This is a RESOURCE decision, not a functional one. Gowin BSRAM has
+    // no byte write enable, so GowinSynthesis implements one by splitting
+    // the array into byte-wide blocks: a 256-bit cache line macro becomes
+    // 32 BSRAMs (each holding 128 x 8 bits of an 18 kb block) instead of
+    // 8. With four such macros that is 128 blocks against the GW2AR-18's
+    // 46 -- RP0002, "the number of BSRAM in the design exceeds the
+    // resource limit". Masters that need partial writes into a wide word
+    // do the read-modify-write themselves (see cache_cntrl's store-hit
+    // path, which merges into the line it already has registered).
+    parameter bit BYTE_WRITE = 1,
     // Optional $readmemh init file (relative to simulation working dir).
     parameter string INIT_FILE = "",
     // Native-protocol struct pair, normally built with the
@@ -136,6 +151,23 @@ module native_ram #(
         end
     end
 
+`ifdef VERILATOR
+    // +RAM_GARBAGE fills the array with junk before time 0. Simulation
+    // otherwise hands out zeros for memory nobody wrote, which is how a
+    // design that trusts its RAM's power-up state passes here and hangs on
+    // a device — the cache's tag valid bits were exactly that bug. A test
+    // that passes with this plusarg does not depend on the accident.
+    initial begin
+        if ($test$plusargs("RAM_GARBAGE") && INIT_FILE == "") begin
+            for (int gi = 0; gi < DEPTH_WORDS; gi++) begin
+                for (int gb = 0; gb < DATA_W; gb++) begin
+                    mem[gi][gb] = 1'($random());
+                end
+            end
+        end
+    end
+`endif
+
     // -----------------------------------------------------------------
     // Address decode (byte address -> word index). Valid only at the
     // accept cycle (req.valid && wready); never sampled after.
@@ -193,7 +225,7 @@ module native_ram #(
     // gates it off entirely (I-mem never writes).
     // -----------------------------------------------------------------
     generate
-        if (!READ_ONLY) begin : gen_write
+        if (!READ_ONLY && BYTE_WRITE) begin : gen_write
             always_ff @(posedge clk_i) begin
                 if (launch_write) begin
                     for (integer i = 0; i < STRB_W; i++) begin
@@ -203,6 +235,27 @@ module native_ram #(
                     end
                 end
             end
+        end else if (!READ_ONLY) begin : gen_write_word
+            // Whole-word write: one BSRAM write enable, no byte lanes.
+            always_ff @(posedge clk_i) begin
+                if (launch_write) begin
+                    mem[word_addr] <= mem_req_i.wdata;
+                end
+            end
+
+`ifdef VERILATOR
+            // A partial strobe here would silently commit the unstrobed
+            // bytes too, which is exactly the bug BYTE_WRITE=0 invites.
+            always_ff @(posedge clk_i) begin
+                if (launch_write) begin
+                    assert (&mem_req_i.wstrb)
+                    else
+                        $fatal(
+                            1, "native_ram: partial wstrb (%b) with BYTE_WRITE=0", mem_req_i.wstrb
+                        );
+                end
+            end
+`endif
         end
     endgenerate
 

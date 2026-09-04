@@ -32,7 +32,8 @@ GTKWAVE       ?= gtkwave
 # VCD written by the sim.
 SIM_VCD       := sim/sim_top.vcd
 
-.PHONY: format format-check format-diff sim wave help clean run sw sw-run cosim
+.PHONY: format format-check format-diff sim bist lint-fpga lint-yosys gatesim wave help clean \
+        run sw sw-run cosim fpga-synth fpga-pnr fpga
 
 help:
 	@echo "Targets:"
@@ -40,6 +41,11 @@ help:
 	@echo "  format-check  exit 1 if any file is unformatted (CI/pre-commit)"
 	@echo "  format-diff   print a unified diff of pending formatting changes"
 	@echo "  sim           build + run the Verilator sim"
+	@echo "  bist          build + run the FPGA board-top self test sim"
+	@echo "  lint-fpga     elaborate + lint fpga_top (no Gowin tools needed)"
+	@echo "  lint-yosys    sv2v+yosys: undriven nets + BSRAM budget check"
+	@echo "  gatesim       gate-level sim of the synthesized netlist (4-state)"
+	@echo "  fpga          Gowin synthesis + place & route (needs gw_sh)"
 	@echo "  wave          build + run the sim, then open the VCD in gtkwave"
 	@echo "  run           build + run the Verilator sim"
 	@echo "  clean         remove simulation build artefacts + waveforms"
@@ -79,6 +85,29 @@ format-diff: $(SV_SOURCES)
 # Build + run the Verilator simulation.
 sim:
 	$(MAKE) -C sim run
+
+# Build + run the FPGA board-top self test (fpga_top + cache_bist against
+# the SDRAM model): the same traffic the Tang Nano 20K bitstream runs.
+bist:
+	$(MAKE) -C sim bist
+
+# Elaborate + lint the FPGA wrapper. Runs without the Gowin toolchain.
+lint-fpga:
+	$(MAKE) -C sim lint-fpga
+
+# Pre-synthesis check with sv2v + yosys: fails on undriven nets (the Gowin
+# EX1998 class) and reports a BSRAM count against the device's 46 blocks
+# (RP0002). Needs sv2v and yosys, neither of which is the Gowin toolchain
+# — see the header of the script for what this does and does not predict.
+lint-yosys:
+	./scripts/yosys_check.sh
+
+# Gate-level simulation of the synthesized netlist (yosys + Icarus). Runs
+# the same BIST testbench the RTL sim runs, in 4-state, so a construct that
+# behaves differently after synthesis shows up here instead of on the
+# bench. See the header of scripts/gatesim.sh.
+gatesim:
+	./scripts/gatesim.sh
 
 # Open the waveforms. A fresh simulation is run first.
 wave: sim
@@ -135,3 +164,33 @@ sw-run: sw
 #
 cosim:
 	$(MAKE) -C sim/cosim/quicksort cosim
+
+# ----------------------------------------------------------------------
+# FPGA build (Gowin EDA, Tang Nano 20K)
+# ----------------------------------------------------------------------
+#
+# Bitstream flow for `yarv32_cache.gprj` (top module `fpga_top`, device
+# GW2AR-LV18QN88C8/I7). Both steps go through the Tcl wrappers in impl/,
+# not through `gw_sh -pnr -do ...` (not a valid flow in V1.9.11.03).
+#
+# gw_sh is NOT on this machine — it lives on the Gowin host (see CLAUDE.md).
+# Point GW_SH at the binary, or rsync the tree over and run there:
+#
+#   make fpga GW_SH=/home/giacomo/gowin_ide/IDE/bin/gw_sh
+#
+# The Qt variables keep the headless invocation from trying to open a GUI.
+# Both steps silently no-op if their outputs already exist, so each target
+# deletes its output directory first.
+#
+GW_SH     ?= gw_sh
+GW_ENV    := QT_QPA_PLATFORM=offscreen QT_OPENGL=software LIBGL_ALWAYS_SOFTWARE=1
+
+fpga-synth:
+	rm -rf impl/gwsynthesis
+	$(GW_ENV) $(GW_SH) impl/synth_check.tcl
+
+fpga-pnr:
+	rm -rf impl/pnr
+	$(GW_ENV) $(GW_SH) impl/pnr_check.tcl
+
+fpga: fpga-synth fpga-pnr

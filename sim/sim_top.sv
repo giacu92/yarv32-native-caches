@@ -68,6 +68,7 @@ module sim_top;
     cache_cntrl u_dut (
         .clk_i        (clk),
         .rstn_i       (rstn),
+        .sdram_clk_i  (clk),
         .icache_req_i (icache_req),
         .icache_rsp_o (icache_rsp),
         .dcache_req_i (dcache_req),
@@ -81,7 +82,15 @@ module sim_top;
         .sdram_dqm_o  (sdram_dqm_o),
         .sdram_addr_o (sdram_addr_o),
         .sdram_ba_o   (sdram_ba_o),
-        .sdram_dq_io  (sdram_dq_io)
+        .sdram_dq_io  (sdram_dq_io),
+        .dbg_state_o  (),               // board-only debug taps (see fpga_top)
+        .dbg_dport_o  (),
+        .dbg_cnt_o    (),
+        .dbg_acc_o    (),
+        .dbg_go_o     (),
+        .dbg_rsp_o    (),
+        .dbg_tick_o   (),
+        .dbg_hb_o     ()
     );
 
     // Behavioral GW2AR embedded-SDRAM model on the raw pins: the real
@@ -144,6 +153,11 @@ module sim_top;
 
     // Phase-S store value (posted store hit at ADDR_D_HIT, doubleword 0).
     localparam logic [63:0] STORE_VAL = 64'h1234_5678_9ABC_DEF0;
+
+    // Phase S3: partial-strobe store hit (bytes 4 and 5 only) over the
+    // STORE_VAL written by Phase S, and the merged value it must produce.
+    localparam logic [63:0] PARTIAL_VAL = 64'hFFFF_A5A5_FFFF_FFFF;
+    localparam logic [63:0] EXP_PARTIAL = {STORE_VAL[63:48], PARTIAL_VAL[47:32], STORE_VAL[31:0]};
 
     // Phase-V dirty eviction, set 77 (0x4D): way 0 holds line A (tag 0x111),
     // way 1 holds a valid filler line (tag 0x333), so a miss on tag 0x222
@@ -210,6 +224,12 @@ module sim_top;
     // index (the DUT shifts by TAG_BYTES_W itself; native_ram drops those
     // low bits as the intra-word byte select).
     initial begin
+        // AFTER the DUT's tag invalidation sweep: cache_cntrl clears every
+        // valid bit at reset (it may not trust the state its tag memory
+        // wakes up in), so a preload at time 0 would simply be wiped.
+        wait (u_dut.tag_init_done);
+        @(posedge clk);
+
         // Way 0 holds a valid tag for the hit addresses, way 1 stays invalid.
         u_dut.gen_way[0].u_itag.mem[set_of(ADDR_I_HIT)] = tag_word(ADDR_I_HIT);
         u_dut.gen_way[1].u_itag.mem[set_of(ADDR_I_HIT)] = {TAG_DATA_W{1'b0}};
@@ -245,7 +265,9 @@ module sim_top;
         u_dut.gen_way[1].u_dcache.mem[set_of(ADDR_A_EV)] = LINE_PATTERN_W1;
     end
 
-    localparam int N_CYCLES = 4000;
+    // Watchdog budget: the 200 us SDRAM power-up wait (20 000 cycles at
+    // this 100 MHz clock) plus the test itself.
+    localparam int N_CYCLES = 30000;
     integer error_count;
     integer wait_rsp;
     integer wait_fsm;
@@ -260,6 +282,15 @@ module sim_top;
         repeat (2) @(posedge clk);
         rstn = 1'b1;
         repeat (2) @(posedge clk);
+
+        // SDRAM power-up wait: cache_cntrl holds the controller in reset
+        // for SDRAM_INIT_US (200 us) so the device sees the NOP-only
+        // window a real part requires. Nothing that touches the SDRAM can
+        // work before that, and the model now flags any command issued
+        // early, so the test waits it out rather than starting into a
+        // device that would have ignored everything.
+        wait (u_dut.init_done);
+        repeat (4) @(posedge clk);
 
         // ---- Phase A: I-cache hit. Poll the CPU-facing rvalid (the internal
         // hit signal is a one-cycle pulse per lookup, not a steady level).
@@ -610,6 +641,61 @@ module sim_top;
         dcache_req.valid = 1'b0;
         repeat (2) @(posedge clk);
 
+        // ---- Phase S3: PARTIAL-strobe store hit. The data macros take
+        // whole-word writes only (native_ram BYTE_WRITE=0 — Gowin BSRAM
+        // has no byte write enable, and inferring one costs 4x the
+        // blocks), so a partial store is a read-modify-write of the line
+        // the hit way already has on its output. Bytes 4-5 of doubleword 0
+        // must change and every other byte of the line must survive.
+        // ----
+        dcache_req.valid  = 1'b1;
+        dcache_req.we     = 1'b1;
+        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_D_HIT};
+        dcache_req.wdata  = PARTIAL_VAL;
+        dcache_req.wstrb  = 8'h30;  // bytes 4 and 5 only
+        dcache_req.rready = 1'b1;
+        repeat (4) @(posedge clk);
+        dcache_req.valid = 1'b0;
+        dcache_req.we    = 1'b0;
+        repeat (2) @(posedge clk);
+
+        dcache_req.valid = 1'b1;
+        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_D_HIT};
+        wait_rsp         = 0;
+        while (!dcache_rsp.rvalid && wait_rsp < 20) begin
+            @(posedge clk);
+            wait_rsp = wait_rsp + 1;
+        end
+        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_PARTIAL) begin
+            error_count = error_count + 1;
+            $display(
+                "FAIL  S3: partial-strobe store hit merged wrong (rvalid=%b expected %h got %h)",
+                dcache_rsp.rvalid, EXP_PARTIAL, dcache_rsp.rdata);
+        end else begin
+            $display("PASS  S3: partial-strobe store hit merged (rdata=%h)", dcache_rsp.rdata);
+        end
+        dcache_req.valid = 1'b0;
+        repeat (2) @(posedge clk);
+
+        // Neighbouring doubleword must still be untouched after the
+        // read-modify-write of doubleword 0.
+        dcache_req.valid = 1'b1;
+        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_D_HIT + 23'd8};
+        wait_rsp         = 0;
+        while (!dcache_rsp.rvalid && wait_rsp < 20) begin
+            @(posedge clk);
+            wait_rsp = wait_rsp + 1;
+        end
+        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_DW1) begin
+            error_count = error_count + 1;
+            $display("FAIL  S4: partial store clobbered the next doubleword (expected %h got %h)",
+                     EXP_DW1, dcache_rsp.rdata);
+        end else begin
+            $display("PASS  S4: next doubleword untouched by the partial store");
+        end
+        dcache_req.valid = 1'b0;
+        repeat (2) @(posedge clk);
+
         // ---- Phase V: full dirty eviction (D-cache, set 77, both ways
         // valid). Way 0 holds line A (tag 0x111); a store makes it dirty,
         // then a miss on tag 0x222 (same set) evicts it — victim = way 0
@@ -730,6 +816,17 @@ module sim_top;
             $display("PASS  V4: store miss write-allocated + merged (rdata=%h)", dcache_rsp.rdata);
         end
         dcache_req.valid = 1'b0;
+
+        // The SDRAM model counts protocol violations (power-up window, MRS
+        // before access, tRP / tRFC / tRCD). They are failures: a run that
+        // passes its data checks while abusing the device proves nothing
+        // about the device.
+        if (u_sdram.protocol_errors != 0) begin
+            error_count = error_count + u_sdram.protocol_errors;
+            $display("FAIL  SDRAM: %0d protocol violation(s)", u_sdram.protocol_errors);
+        end else begin
+            $display("PASS  SDRAM: no protocol violations");
+        end
 
         if (error_count == 0) $display("\n[sim_top] ALL CHECKS PASSED");
         else $display("\n[sim_top] %0d CHECK(S) FAILED", error_count);

@@ -27,6 +27,12 @@
  *     bank flags an error — the controller must ACTIVATE first.
  *   - REF needs no storage action (no retention in sim); MRS is latched
  *     and checked against the expected BL=1 / CL=3 mode word.
+ *   - Power-up: no command other than NOP is legal for the first 100 us,
+ *     and no ACT/READ/WRITE is legal before MRS. tRP, tRFC and tRCD are
+ *     checked in nanoseconds, so they hold at any clock rate. Every
+ *     violation increments protocol_errors, which the testbenches treat
+ *     as a failure — a controller that skips the power-up wait used to
+ *     simulate perfectly here and do nothing at all on a device.
  *
  * The backing array is preloaded with a recognizable pattern so refills
  * return non-zero data: word value = 32'hCAFE0000 | word_index[15:0],
@@ -71,17 +77,33 @@ module sdram_model (
     //   PALL: ras=0 cas=1 we=0   WRITE : ras=1 cas=0 we=0
     //   REF : ras=0 cas=0 we=1   MRS   : ras=0 cas=0 we=0
     // -----------------------------------------------------------------
-    wire           cmd_sampled = cke && !cs_n;
-    wire           is_act = cmd_sampled && !ras_n && cas_n && we_n;
-    wire           is_read = cmd_sampled && ras_n && !cas_n && we_n;
-    wire           is_write = cmd_sampled && ras_n && !cas_n && !we_n;
-    wire           is_pall = cmd_sampled && !ras_n && cas_n && !we_n;
-    wire           is_ref = cmd_sampled && !ras_n && !cas_n && we_n;
-    wire           is_mrs = cmd_sampled && !ras_n && !cas_n && !we_n;
+    wire cmd_sampled = cke && !cs_n;
+    wire is_act = cmd_sampled && !ras_n && cas_n && we_n;
+    wire is_read = cmd_sampled && ras_n && !cas_n && we_n;
+    wire is_write = cmd_sampled && ras_n && !cas_n && !we_n;
+    wire is_pall = cmd_sampled && !ras_n && cas_n && !we_n;
+    wire is_ref = cmd_sampled && !ras_n && !cas_n && we_n;
+    wire is_mrs = cmd_sampled && !ras_n && !cas_n && !we_n;
 
     // -----------------------------------------------------------------
     // Row-bank state + read pipeline.
     // -----------------------------------------------------------------
+    // Power-up rules. A real SDRAM ignores every command until it has seen
+    // stable clock and NOPs for at least 100 us, and it will not behave
+    // predictably until its mode register has been programmed. The model
+    // enforces both: without them a controller that starts issuing after a
+    // few hundred nanoseconds — which is what the stffrdhrn core does on
+    // its own, 15 cycles — simulates perfectly and does nothing at all on
+    // a device.
+    localparam time INIT_MIN = 100us;
+
+    logic mrs_done_q;
+    time last_pall_time, last_ref_time, last_act_time[4];
+
+    localparam time T_RP = 20ns;  // PRECHARGE -> next command to that bank
+    localparam time T_RFC = 66ns;  // REFRESH -> next command
+    localparam time T_RCD = 18ns;  // ACTIVATE -> READ/WRITE on that bank
+
     logic          row_open_q                                           [4];
     logic   [10:0] row_q                                                [4];
     logic   [ 9:0] mode_q;
@@ -102,7 +124,11 @@ module sdram_model (
             row_open_q[b] = 1'b0;
             row_q[b]      = '0;
         end
-        mode_q    = '0;
+        mode_q         = '0;
+        mrs_done_q     = 1'b0;
+        last_pall_time = 0;
+        last_ref_time  = 0;
+        for (integer b2 = 0; b2 < 4; b2++) last_act_time[b2] = 0;
         rd_pipe_q = '0;
         dq_oe_q   = 1'b0;
         dq_q      = '0;
@@ -123,9 +149,53 @@ module sdram_model (
             end
         end
 
+        // Power-up window: NOP only. Anything else is a command the device
+        // would have ignored.
+        if ((is_act || is_read || is_write || is_pall || is_ref || is_mrs) &&
+            ($time < INIT_MIN)) begin
+            protocol_errors <= protocol_errors + 1;
+            $display("SDRAM MODEL ERROR: command at %0t, before the %0t power-up wait", $time,
+                     INIT_MIN);
+        end
+
+        // Accesses before the mode register is programmed have undefined
+        // burst length and CAS latency on a real part.
+        if ((is_act || is_read || is_write) && !mrs_done_q) begin
+            protocol_errors <= protocol_errors + 1;
+            $display("SDRAM MODEL ERROR: access at %0t before MRS", $time);
+        end
+
         if (is_act) begin
-            row_open_q[ba] <= 1'b1;
-            row_q[ba]      <= addr;
+            if ($time - last_pall_time < T_RP) begin
+                protocol_errors <= protocol_errors + 1;
+                $display("SDRAM MODEL ERROR: tRP violated (ACT %0t after PALL)",
+                         $time - last_pall_time);
+            end
+            if ($time - last_ref_time < T_RFC) begin
+                protocol_errors <= protocol_errors + 1;
+                $display("SDRAM MODEL ERROR: tRFC violated (ACT %0t after REF)",
+                         $time - last_ref_time);
+            end
+            last_act_time[ba] <= $time;
+            row_open_q[ba]    <= 1'b1;
+            row_q[ba]         <= addr;
+        end else if (is_read) begin
+            if ($time - last_act_time[ba] < T_RCD) begin
+                protocol_errors <= protocol_errors + 1;
+                $display("SDRAM MODEL ERROR: tRCD violated (READ %0t after ACT)",
+                         $time - last_act_time[ba]);
+            end
+        end
+        if (is_write) begin
+            if ($time - last_act_time[ba] < T_RCD) begin
+                protocol_errors <= protocol_errors + 1;
+                $display("SDRAM MODEL ERROR: tRCD violated (WRITE %0t after ACT)",
+                         $time - last_act_time[ba]);
+            end
+        end
+
+        if (is_act) begin
+            // handled above
         end else if (is_read) begin
             if (!row_open_q[ba]) begin
                 protocol_errors <= protocol_errors + 1;
@@ -144,17 +214,20 @@ module sdram_model (
             end
             if (addr[10]) row_open_q[ba] <= 1'b0;  // auto-precharge
         end else if (is_pall) begin
+            last_pall_time <= $time;
             if (addr[10]) begin
                 for (int b = 0; b < 4; b++) row_open_q[b] <= 1'b0;
             end
         end else if (is_mrs) begin
-            mode_q <= addr[9:0];
+            mode_q     <= addr[9:0];
+            mrs_done_q <= 1'b1;
             if (addr[9:0] != 10'b1000110000) begin
                 protocol_errors <= protocol_errors + 1;
                 $display("SDRAM MODEL ERROR: unexpected mode word %b", addr[9:0]);
             end
         end else if (is_ref) begin
-            // No retention to maintain in sim.
+            // No retention to maintain in sim, but the timing still counts.
+            last_ref_time <= $time;
         end
     end
 

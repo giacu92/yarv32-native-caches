@@ -1,14 +1,25 @@
-# Verilator build artefacts
+# Simulation build artefacts and waveforms (gate-level runs drop a VCD
+# wherever they are invoked from, not just under sim/)
 sim/obj_dir/
-sim/*.vcd
+sim/obj_bist/
+sim/obj_xdir/
+sim/obj_xbist/
+*.vcd
 
-# Gowin IDE / gw_sh output
+# Gowin IDE / gw_sh outputs. The project file, the constraints (src/phys)
+# and the impl/ Tcl wrappers + process config ARE tracked — only what a run
+# generates is ignored.
 *.fs
 *.prj
-*.gprj
-impl*/
+*.gprj.user
+impl/gwsynthesis/
+impl/pnr/
+impl/*.log
 temp/
 .claude/
+
+# Patches generated for review / git am
+*.patch
 
 # Hash-analysis leftovers (hash dropped from RTL; env is machine-local)
 sim/hashing/cache_hash_env/

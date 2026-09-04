@@ -199,22 +199,86 @@ submodule at `src/ips/sdram-controller`, branch `gw2ar-32bit`:
 
 Follow-ups (open):
 
-- [ ] **Push the `gw2ar-32bit` branch**: fork
-  `stffrdhrn/sdram-controller` on GitHub, push the branch, point
-  `.gitmodules` at the fork (currently the URL is upstream's, so a fresh
-  clone cannot fetch the branch). Upstream has NO LICENSE file (BSD claim
-  only in the README) — add one in the fork.
-- [ ] FPGA clocking: pick the real system clock and `CLK_FREQUENCY`
-  (refresh spacing), and the `sdram_clk_o` phase alignment the embedded
-  SDRAM needs (today `sdram_clk_o = clk_i`, single clock domain).
+- [x] **Push the `gw2ar-32bit` branch**: done — `.gitmodules` points at the
+  fork `github.com/giacu92/sdram-controller`, and a fresh
+  `git submodule update --init` fetches the branch.
+- [ ] The fork still has NO LICENSE file (upstream claims BSD only in its
+  README) — add one.
+- [x] FPGA clocking: 50 MHz single clock domain. `cache_cntrl` takes a
+  `CLK_FREQ_MHZ` parameter (default 100 = the sim's clock) that feeds the
+  controller's `CLK_FREQUENCY` refresh spacing; `fpga_top` passes 50.
+  `sdram_clk_o` is no longer tied to `clk_i`: `cache_cntrl` forwards a new
+  `sdram_clk_i` port, which `fpga_top` drives from the rPLL's CLKOUTP with
+  a static 180-degree shift (`PSDA_SEL="1000"`). The shift is a bring-up
+  starting point, not a measured optimum — see the sweep note in
+  `fpga_top.sv` if reads are flaky on the board.
 - [ ] Optional perf: BL=1 + auto-precharge costs ~10 cycles per word
   (~80 cycles per line refill, ~160 with a dirty writeback). If that
   starves the CPU, a burst-capable controller is the upgrade path
   (revisit the Gowin HS IP once its docs are at hand, or extend upstream).
 
-## Phase 6 — FPGA build for Tang Nano 20K
+## Phase 6 — FPGA build for Tang Nano 20K — IN PROGRESS
 
-- [ ] Create the Gowin project/constraints: target `GW2AR-LV18QN88C8/I7`
+Done 2026-09-04 (`make sim`, `make bist`, `make lint-fpga`, `make
+format-check` all green):
+
+- [x] FPGA top wrapper `src/rtl/fpga_top.sv` with the toolchain's fixed
+  embedded-SDRAM port names (`O_sdram_*` / `IO_sdram_dq`), the 25 -> 50 MHz
+  rPLL, the phase-shifted SDRAM clock, reset synchronization and status
+  LEDs.
+- [x] Bring-up traffic generator `src/rtl/cache_bist.sv`: 8 stores to one
+  set (different tags each, so a 2-way cache evicts through the writeback
+  path), 8 compares on read-back, then I-port fetches for liveness, with a
+  watchdog so a stuck port shows FAIL instead of a dark board. Without a
+  driver on the CPU ports the synthesizer would prune the whole subsystem.
+- [x] `sim/bist_tb.sv` + `make bist`: runs exactly what the bitstream runs
+  (fpga_top with the rPLL bypassed, the real controller, the SDRAM model)
+  and fails on either a compare mismatch or a timeout. Negative-control
+  checked: inverting the compare makes it fail.
+- [x] Gowin project + constraints: `yarv32_cache.gprj`,
+  `src/phys/yarv32_cache.cst` (clk PIN10, rst PIN88, LEDs 15-18; the SIP
+  SDRAM deliberately gets no entries), `src/phys/yarv32_cache.sdc`
+  (25 MHz reference, 50 MHz generated core clock, false paths), and the
+  `impl/` Tcl wrappers + process config. `.gitignore` now tracks these and
+  ignores only what a run generates.
+- [x] `make fpga` / `fpga-synth` / `fpga-pnr` (Tcl wrappers via `gw_sh`,
+  headless), plus `make lint-fpga` as a toolchain-free elaboration gate.
+  gw_sh is not installed on this machine — pass `GW_SH=<path>` or run on
+  the Gowin host.
+
+Open:
+
+- [x] First synthesis run on the Gowin host surfaced two errors, both
+  fixed: `EX1998` (net `bootr_req.valid` has no driver — the bootrom port
+  is now tied off to `'0` until a fetch mux exists) and `RP0002` (136
+  BSRAMs against the device's 46). The BSRAM blow-up was byte write
+  enables: Gowin BSRAM has none, so a byte-writable 256-bit line macro is
+  built from 32 byte-wide blocks instead of 8 (4 data macros = 128, plus 2
+  per tag macro = 136 exactly). `native_ram` gained a `BYTE_WRITE`
+  parameter, all eight cache macros set it to 0, and the D-cache store hit
+  became a whole-line read-modify-write merging into `dcache_line`, which
+  the hit way already has on its output. Expected mapping now: 8 blocks per
+  data macro (32) + 1 per tag macro (4) = 36 of 46. New TB phases S3/S4
+  cover the partial-strobe store hit and its neighbour.
+- [x] SDC error `TA2003` ("Can't set timing constraint to object
+  sdram_clk") plus `TA1052` ("Generated clock is ignored"): the explicit
+  `create_generated_clock` on the SDRAM clock is gone. That net drives
+  nothing but the `O_sdram_clk` pin, so it does not survive as a
+  constrainable object, and nothing is lost — Gowin auto-derives a clock on
+  the rPLL output and no fabric logic runs on it.
+- [x] Local pre-synthesis gate `make lint-yosys` (`scripts/yosys_check.sh`,
+  sv2v + yosys): fails on undriven nets (the EX1998 class — verified: it
+  fails when the bootrom tie-off is removed) and reports a BSRAM count
+  against 46 (currently 36). Caveat, measured: yosys reports 36 either way,
+  so it would NOT have caught the byte-enable blow-up — GowinSynthesis's
+  memory mapping is its own.
+- [ ] Re-run the flow: synthesis + PnR on the Gowin host, confirm the BSRAM
+  count, read the timing report, fix critical paths at 50 MHz.
+- [ ] Constraints follow-up after the first PnR: whether the SDRAM
+  interface needs `set_input_delay`/`set_output_delay` or a multicycle
+  path once real numbers exist (today only the false paths are declared).
+- [ ] Original wording of the project/constraints item, for reference:
+  target `GW2AR-LV18QN88C8/I7`
   (QFN88), `gw2ar18c-000` speed grade, Tang Nano 20K constraint file
   (`.cst`) — clocks, reset, LEDs. NOTE: the embedded SDRAM is SIP — it
   gets NO `.cst` entries; the toolchain connects it automatically when the
@@ -228,15 +292,147 @@ Follow-ups (open):
   words × 128 sets — trivial), plus I/O and SDRAM controller. Check the
   GW2AR-18's 46 BSRAMs cover data + tags with the chosen tag word width
   (see Phase 0's power-of-2 decision).
-- [ ] Add a `gw_sh` synthesis script target (`make fpga`) alongside the IDE
-  flow; run GowinSynthesis + timing report, fix critical paths (the
-  registered-request Phase-2 work exists for exactly this).
-- [ ] Timing constraints: `sdram_clk_o` phase alignment the embedded SDRAM
-  needs (today `sdram_clk_o = clk_i`; pick the PLL phase per the board
-  docs), `set_false_path`/multicycle where the SDRAM interface requires
-  it.
-- [ ] Board bring-up: minimal fetch loop through the bootrom, then LED/UART
-  heartbeat driven by cache hits/misses before any CPU integration.
+- [ ] Board bring-up. LEDs (active low, lit = signal true): [0] fail,
+  [1] pass, [2] busy, [3] heartbeat, [5:4] fail code (00 none, 01 data
+  mismatch, 10 D-port watchdog, 11 I-port watchdog). A dark heartbeat
+  points at the clock/reset; busy stuck lit points at a port that never
+  answers; fail lit means the test finished badly and the code says how.
+  First run on the board (2026-09-04) reported FAIL with the heartbeat
+  alive — the fail code was added in response, and the second run read
+  back code 10, D-PORT WATCHDOG: the SDRAM round trip never completes, so
+  the BIST sits on a store/load until the watchdog fires. That is a stuck
+  handshake, not wrong data, so the miss-FSM state at the failure is now
+  latched and displayed too (second LED frame). Next run: read that state.
+  `S_REFILL_ISSUE`/`S_WB_ISSUE` means the controller never raised busy;
+  `S_REFILL_WAIT` means `rd_ready` never pulsed; `S_WB_WAIT` means busy
+  never fell. If the code ever turns into 01 (data mismatch) instead, the
+  lever is the clock phase: sweep `SDRAM_PSDA_SEL` in `fpga_top`
+  ("1100" = 270 deg, "0100" = 90 deg).
+  Third run read back state `S_IDLE`: the miss FSM was doing NOTHING when
+  the D-port watchdog fired, so the stall is in the cache's own
+  request/response handshake (a `wready` or `rvalid` that never comes), not
+  in the SDRAM path. Two encoded LED fields are not enough to localize
+  that, so bring-up now has a real console: `dbg_uart_tx` + `dbg_reporter`
+  print a `"F.. G.. C.. D.. B.. I.. S.."` line on PIN69 (115200 8N1).
+  Fourth run read `F2 C0 B6 I0 S1`: fail code 2 (D-port watchdog), miss FSM
+  idle, and the LIVE stage already back at `S_DONE` — which is why the
+  stage and the D-port occupancy are now latched at the failure too (`G`
+  and `D`). `D` is `{slot occupied, lookup launched, miss awaiting FSM
+  pickup, queue non-empty}`, so the next line separates the three ways a
+  D-port transfer can wedge: never accepted (slot occupied, no progress),
+  accepted but the miss never picked up, or answered but the response
+  never popped.
+  Fifth run read `F2 G1 C0 DC B6 I0 S1`: the failure is on the FIRST store
+  (`G1`, `I0`), the miss FSM is idle, and `D=C` says the skid slot is
+  occupied with its lookup marked launched but NO miss pending and NO
+  queued response — the request went in and nothing ever came back out. A
+  final-state snapshot cannot separate "the tag answer never arrived" from
+  "it arrived and the slot was never freed", so `cache_cntrl` now counts
+  the four steps a request passes through (`dbg_cnt_o`, printed as
+  `L P M U`: lookups, tag answers, misses picked up, unstalls). Next run:
+  the first of the four that stopped advancing is the step that never
+  happened. Simulation prints `L4 P4 M4 U3` at the same point, so any
+  count stuck at 0 on the board is the divergence.
+  Sixth run read `... L0 P0 M0 U0` next to the latched `D=C` — a
+  contradiction, since `slot_lookup_q` (the `D` bit) and the `L` counter
+  are driven by the same `cache_lookup_go[1]`. The two simply described
+  different instants: `D` is latched at the failure, while the counters
+  were read afterwards, and the old watchdog path fell through to `S_DONE`,
+  which drops the stalled request and lets the port recover. The BIST now
+  HOLDS the hung stage instead (`hung_q`), so the live fields are the stall
+  itself, and two more live fields were added: `E` (D-port bits) and `W`
+  (`{wready, rvalid, req.valid, we}` as the master sees them). Verified in
+  simulation with a forced hang: the post-mortem line reads
+  `F2 G1 C0 D4 B1 I0 S1 LF PF M1 U1 E8 W3`.
+- [x] ROOT CAUSE of the board hang, from the frozen line
+  `F2 G1 C0 DC B1 I0 S1 L0 P0 M0 U0 EC W3`: `W3` says the master holds a
+  store with `wready` low, `E=C` says a skid slot is occupied with its
+  lookup already marked launched, and `L0` says `cache_lookup_go[1]` never
+  fired — which is consistent only if `slot_lookup_q` came up SET, because
+  `cache_lookup_go = skid_valid && !slot_lookup`. Those flops were never
+  reset on the device: `cache_cntrl` declared its state as UNPACKED arrays,
+  which synthesis treats as memories (yosys: 51 "Replacing memory" lines)
+  and may implement as LUT-RAM/BSRAM, which has no reset. Every state and
+  control array is now a packed vector, which cannot be inferred as
+  memory. Simulation could never have caught this: there an unpacked array
+  is just flops that reset.
+- [ ] The packed-array fix did NOT clear the board hang: build `V4` reports
+  the same `F2 G1 C0 DC B1 I0 S1 L0 P0 M0 U0 EC W3`. So the two readings
+  that cannot both be true still stand — `E=C` says the skid slot is
+  occupied with its lookup marked launched, `L0` says `cache_lookup_go[1]`
+  never fired. Build `V5` settles which one lies: `A` counts D-port
+  ACCEPTS, and the slot cannot be occupied without one, so `A0` would
+  indict the counter path itself rather than the events. `K` and `R` tap
+  the lookup issue and the macro answers live ({go, fsm gate, tag valid,
+  tag wready} and {tag rvalid, data rvalid, slot_rsp[0], slot_rsp[1]}),
+  which with the hang hold are the values AT the stall.
+  Build `V5` answered: `A0`. The skid slot is occupied and NO accept was
+  ever counted — the two cannot both be true of a running design, so the
+  events did not happen and the state was already there: `cache_cntrl`'s
+  flops are sitting at power-up values, not at reset values. The RTL reset
+  is complete (checked line by line), so the suspect is the reset PULSE.
+  `fpga_top` derived it from `rst_i` (a released button) and `pll_lock`
+  (possibly already high at configuration): if neither produces a falling
+  edge, the design is never reset at all. Build `V6` replaces that with a
+  counter-based power-on reset that depends on no edge — it holds the
+  fabric in reset for 4096 clocks and releases — and adds `T`, a
+  free-running tick inside `cache_cntrl` that MUST change between report
+  lines. If `T` is frozen, that module's clock is dead and every counter
+  above is meaningless; if `T` moves and `A` is still 0, the accept path
+  itself is at fault.
+- [x] ROOT CAUSE (2026-09-04, found by gate-level simulation): the tag RAMs
+  were never invalidated. Nothing in the design cleared the valid bits, so
+  the cache trusted whatever state its tag memory woke up in. RTL
+  simulation passed only because Verilator reads an uninitialised array as
+  zero. The gate-level run (`make gatesim`: yosys netlist, Icarus, 4-state)
+  reproduces the board exactly — the VCD shows reset released at 81.93 us
+  and `skid_valid_q[1][0]` going X two cycles later, the X propagating
+  through the hit/miss decision into `wready`, and the BIST wedging on its
+  first store, which is the `F2 G1 C0 DC ... W3` line the board prints.
+  Fix: `cache_cntrl` sweeps every set at reset writing `valid=0` into all
+  four tag macros and holds both ports' `wready` low for those N_SETS
+  cycles. `sim_top`'s hierarchical tag preload now waits for
+  `tag_init_done`, or the sweep would wipe it.
+  Scope check (control test, not assumption): disable the sweep and fill
+  the RAMs with DEFINED junk (`+RAM_GARBAGE`) and both testbenches still
+  pass — garbage tags only cause spurious misses and writebacks. So the
+  sweep fixes X propagation and any device whose RAM wakes up non-zero, but
+  it does not explain the board hang. That one is still open: on the board
+  `cache_cntrl`'s flops do not advance at all (`T` frozen, `A0`), which no
+  simulation here reproduces — the gate-level netlist clocks `tick_q`
+  40904 times. Next datum: `led_o[5]` (pin 20) carries `tick_q[24]` through
+  nothing but a wire, so it blinks if and only if that module is clocked.
+- [x] `led_o[5]` BLINKS at ~1.5 Hz on the board: `cache_cntrl` IS clocked,
+  and the "frozen module" reading was wrong. The `T` field was constant
+  because the probe was ALIASED — it exported `tick_q[15:12]`, period 2**16
+  clocks, while the reporter samples every 2**24 clocks, an exact multiple,
+  so every sample landed on the same phase. A constant probe reads exactly
+  like a dead clock; the field now uses bits that are not commensurate with
+  the sample period.
+- [x] ROOT CAUSE (board), consistent with every reading once the clock is
+  known good: the fabric is NEVER RESET. `cache_cntrl`'s flops sit at
+  power-up values — `skid_valid_q[1][0]=1` fills the only outstanding slot
+  so `wready` can never rise (hence `A0`, no accept ever), and
+  `slot_lookup_q[1][0]=1` keeps `cache_lookup_go` low forever (hence `L0`).
+  The V6 power-on counter could not help: `por_cnt_q` has no reset of its
+  own, so if it powers up at all-ones `por_done` is true from the first
+  instant, `rstn_raw` is high from the start, the synchroniser never sees an
+  edge, and no reset pulse is ever produced. The Gowin process config had
+  `"Initialize_Primitives": false`, which is what leaves those power-up
+  values undefined. Fix (build `V10`): explicit initial values on the reset
+  chain (`por_cnt_q`, `rstn_sync_q`) plus `Initialize_Primitives` /
+  `-init_primitives 1` so the device honours them.
+- [x] Second real divergence, found while auditing the same class: the
+  SDRAM power-up wait. The controller leaves reset after 15 NOP cycles
+  (300 ns at 50 MHz); the device requires at least 100 us of stable clock
+  and NOPs before it accepts PRECHARGE / REFRESH / MRS, so on hardware the
+  mode register was never programmed. `cache_cntrl` now holds the
+  controller in reset for `SDRAM_INIT_US` (200 us, sized from
+  `CLK_FREQ_MHZ`), and `sdram_model` enforces the window plus MRS-before-
+  access and tRP / tRFC / tRCD, with both testbenches failing on any
+  violation. Verified both ways: with the hold the sim passes; with
+  `SDRAM_INIT_US = 1` the model reports the early commands and the run
+  fails.
 
 ## Phase 7 — Verification hardening
 

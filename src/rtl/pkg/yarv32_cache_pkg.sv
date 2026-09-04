@@ -41,13 +41,13 @@
 package yarv32_cache_pkg;
 
     // CPU-side native protocol: 64-bit data, 64-bit byte address.
-    localparam int unsigned MEM_WIDTH        = 64;
-    localparam int unsigned STRB_WIDTH       = MEM_WIDTH / 8;
+    localparam int unsigned MEM_WIDTH = 64;
+    localparam int unsigned STRB_WIDTH = MEM_WIDTH / 8;
 
     // Cache-line variant: one whole cache line per RAM word (2^5 = 32 B
     // at CL_SIZE=5). Must stay consistent with cache_cntrl's
     // DATA_WIDTH = 2**(CL_SIZE+3).
-    localparam int unsigned CACHE_WIDTH      = 256;
+    localparam int unsigned CACHE_WIDTH = 256;
     localparam int unsigned CACHE_STRB_WIDTH = CACHE_WIDTH / 8;
 
     // Native protocol, CPU width: fetch/LSU side, bootrom.

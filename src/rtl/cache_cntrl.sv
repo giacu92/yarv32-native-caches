@@ -2,7 +2,7 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
-import yarv32_cache_pkg::*;
+import rv32_pkg::*;
 
 /**
  * Cache line size: 32 byte
@@ -23,10 +23,31 @@ module cache_cntrl #(
     // Number of way (caches are set-associative)
     parameter int N_WAY = 2,
     // Cache width in bits (depth = 2^CACHE_SIZE bytes). Both have same size
-    parameter int CACHE_SIZE = 13  // 2^13 = 8 KiB
+    parameter int CACHE_SIZE = 13,  // 2^13 = 8 KiB
+    // System clock frequency in MHz. Only used to space the SDRAM refresh
+    // bursts (sdram_controller's CYCLES_BETWEEN_REFRESH); it must match the
+    // real clk_i rate or the SDRAM is refreshed too rarely (data loss) or
+    // too often (wasted bandwidth). Sim runs at 100 MHz (10 ns period in
+    // sim_top); the Tang Nano 20K build passes 50 (see fpga_top).
+    parameter int CLK_FREQ_MHZ = 100,
+    // SDRAM power-up wait, in microseconds. JEDEC SDRAM (and the GW2AR's
+    // embedded die) requires stable clock and NOP-only for at least 100 us
+    // after power-up before it will accept PRECHARGE / REFRESH / MRS. The
+    // controller only counts 15 cycles of its own (300 ns at 50 MHz), so
+    // its reset is held here until the wait has elapsed; while it is in
+    // reset it drives NOP, which is exactly what the chip wants to see.
+    // Skipping this is invisible in simulation but leaves a real device
+    // with an unprogrammed mode register and undefined reads.
+    parameter int SDRAM_INIT_US = 200
 ) (
     input wire clk_i,
     input wire rstn_i,
+
+    // Clock forwarded to the SDRAM's own clock pin. On the FPGA this is a
+    // phase-shifted copy of clk_i (the chip samples the command/data pins
+    // on ITS clock edge, so the shift is what buys setup/hold margin
+    // across the SIP wiring); in sim it is simply clk_i.
+    input wire sdram_clk_i,
 
     // ICACHE Interface
     input  mem_req_t icache_req_i,
@@ -46,7 +67,59 @@ module cache_cntrl #(
     output wire [ 3:0] sdram_dqm_o,    // O_sdram_dqm
     output wire [10:0] sdram_addr_o,   // O_sdram_addr
     output wire [ 1:0] sdram_ba_o,     // O_sdram_ba
-    inout  wire [31:0] sdram_dq_io     // IO_sdram_dq
+    inout  wire [31:0] sdram_dq_io,    // IO_sdram_dq
+
+    // Debug: the miss FSM's current state (fsm_state_e). Board bring-up
+    // has no other way to see where a miss got stuck — see fpga_top, which
+    // puts this on the LEDs when the self test fails.
+    output wire [3:0] dbg_state_o,
+
+    // Debug: why the D port is (not) accepting. A stalled port waits either
+    // on its own skid slot or on the miss FSM, and these bits say which:
+    //   [3] slot 0 occupied   [2] lookup launched for it
+    //   [1] slot missed, waiting for the FSM to pick it up
+    //   [0] the response queue holds an unconsumed entry
+    output wire [3:0] dbg_dport_o,
+
+    // Debug: D-cache event counters, saturating at 15, in the order a
+    // request passes through them — lookups launched, tag answers seen,
+    // misses picked up by the FSM, misses unstalled. The final state alone
+    // cannot say whether a wedged port never got an answer, got one and
+    // lost it, or completed a refill that failed to free the slot; these
+    // separate the three in one run.
+    //   [3:0] lookups  [7:4] tag answers  [11:8] misses  [15:12] unstalls
+    output wire [15:0] dbg_cnt_o,
+
+    // Debug: D-port accepts, saturating at 15. A control counter — the
+    // skid slot cannot be occupied without an accept, so a zero here means
+    // the counters (or the path that reports them) are lying, not that the
+    // event never happened.
+    output wire [3:0] dbg_acc_o,
+
+    // Debug, live: the lookup issue path.
+    //   [3] cache_lookup_go[1]   [2] fsm_lookup_gate[1]
+    //   [1] dtag_req[0].valid    [0] dtag_rsp[0].wready
+    output wire [3:0] dbg_go_o,
+
+    // Debug, live: the macro answers this cache is waiting for.
+    //   [3] dtag_rsp[0].rvalid   [2] dmem_rsp_d[0].rvalid
+    //   [1] slot_rsp_q[1][0]     [0] slot_rsp_q[1][1]
+    output wire [3:0] dbg_rsp_o,
+
+    // Debug: free-running tick, incremented every clock with no condition
+    // attached. It answers the one question every other counter leaves
+    // open — whether this module's flops are advancing at all. A value
+    // that never changes between report lines means no clock or a reset
+    // held low, and every zero counter elsewhere then says nothing about
+    // the design.
+    output wire [3:0] dbg_tick_o,
+
+    // Debug: a slow bit of the same free-running tick, for an LED. It
+    // reaches a pin through nothing but a flop and a wire — no counters,
+    // no report path, no UART. If this LED does not blink while the
+    // board's other one does, this module is not being clocked, and that
+    // conclusion depends on no other logic being correct.
+    output wire dbg_hb_o
 );
 
     // ===================================================================
@@ -130,15 +203,15 @@ module cache_cntrl #(
     mem_req_t bootr_req;  // towards bootrom
     mem_rsp_t bootr_rsp;  // from bootrom
 
-    way_req_t imem_req[N_WAY];  // towards icache ways
-    way_rsp_t imem_rsp_d[N_WAY];  // from icache ways
-    way_req_t dmem_req[N_WAY];  // towards dcache ways
-    way_rsp_t dmem_rsp_d[N_WAY];  // from dcache ways
+    way_req_t [N_WAY-1:0] imem_req;  // towards icache ways
+    way_rsp_t [N_WAY-1:0] imem_rsp_d;  // from icache ways
+    way_req_t [N_WAY-1:0] dmem_req;  // towards dcache ways
+    way_rsp_t [N_WAY-1:0] dmem_rsp_d;  // from dcache ways
 
-    tag_req_t itag_req[N_WAY];  // towards itag ways
-    tag_rsp_t itag_rsp[N_WAY];  // from itag ways
-    tag_req_t dtag_req[N_WAY];  // towards dtag ways
-    tag_rsp_t dtag_rsp[N_WAY];  // from dtag ways
+    tag_req_t [N_WAY-1:0] itag_req;  // towards itag ways
+    tag_rsp_t [N_WAY-1:0] itag_rsp;  // from itag ways
+    tag_req_t [N_WAY-1:0] dtag_req;  // towards dtag ways
+    tag_rsp_t [N_WAY-1:0] dtag_rsp;  // from dtag ways
 
     // SDRAM controller host interface (sdram_controller, src/ips submodule):
     // one 32-bit word per transaction, accepted in IDLE (busy rises one
@@ -170,20 +243,20 @@ module cache_cntrl #(
     // fetch unit's 2 in-flight reads), 1 for the D-port (single-outstanding).
     localparam int SKID_DEPTH[N_CACHE] = '{2, 1};
 
-    mem_req_t skid_q[N_CACHE][N_SLOT];  // accepted requests (skid slots)
-    logic skid_valid_q[N_CACHE][N_SLOT];  // slot occupied
-    logic slot_lookup_q[N_CACHE][N_SLOT];  // lookup launched for this slot
-    logic slot_rsp_q[N_CACHE][N_SLOT];  // this slot's tag answer arrives now
-    logic miss_seen_q[N_CACHE][N_SLOT];  // slot missed; waiting for FSM pickup
-    logic [N_SLOT-1:0] slot_miss_q[N_CACHE];  // slot's miss taken by the FSM:
+    mem_req_t [N_CACHE-1:0][N_SLOT-1:0] skid_q;  // accepted requests (skid slots)
+    logic [N_CACHE-1:0][N_SLOT-1:0] skid_valid_q;  // slot occupied
+    logic [N_CACHE-1:0][N_SLOT-1:0] slot_lookup_q;  // lookup launched for this slot
+    logic [N_CACHE-1:0][N_SLOT-1:0] slot_rsp_q;  // this slot's tag answer arrives now
+    logic [N_CACHE-1:0][N_SLOT-1:0] miss_seen_q;  // slot missed; waiting for FSM pickup
+    logic [N_CACHE-1:0][N_SLOT-1:0] slot_miss_q;  // slot's miss taken by the FSM:
     // blocks younger queue entries until the miss completes (unstall)
 
     // Response queue (per cache): captured hit data, delivered to the CPU in
     // accept order. rvalid is a LEVEL held until rready pops the head —
     // protocol compliance, not a one-cycle lookup pulse.
-    logic [MEM_WIDTH-1:0] rq_q[N_CACHE][N_SLOT];  // rq_q[c][0] is the head
-    logic rq_blk_q[N_CACHE][N_SLOT];  // entry waits behind an older miss
-    logic [1:0] rq_cnt_q[N_CACHE];  // entries in the queue (0..2)
+    logic [N_CACHE-1:0][N_SLOT-1:0][MEM_WIDTH-1:0] rq_q;  // rq_q[c][0] is the head
+    logic [N_CACHE-1:0][N_SLOT-1:0] rq_blk_q;  // entry waits behind an older miss
+    logic [N_CACHE-1:0][1:0] rq_cnt_q;  // entries in the queue (0..2)
 
     // Lookup compare context, registered at lookup launch. With back-to-back
     // I-port lookups the address split has already moved on to the next slot
@@ -199,37 +272,45 @@ module cache_cntrl #(
     // slot" is unambiguous. The 0 defaults are unreachable whenever the
     // corresponding strobe (accept / lookup_go / rsp pulse / fsm latch) is
     // asserted.
-    int slot_free[N_CACHE];  // first free slot (skid full only if !wready)
-    int slot_lookup_sel[N_CACHE];  // slot to launch the lookup for
-    int slot_rsp_sel[N_CACHE];  // slot the tag answer belongs to
-    int slot_miss_sel[N_CACHE];  // oldest slot the FSM will pick up
-    logic slot_miss_wait[N_CACHE];  // a slot awaits FSM pickup
-    int slot_outstanding[N_CACHE];  // occupied slots + queue entries
+    // Index widths are MINIMAL, never int. A 32-bit index into a packed
+    // array asks the tool what the other four billion positions mean:
+    // simulation clamps to the value in range, synthesis is free to build
+    // something else, and the two stop agreeing. sv2v made that visible as
+    // hundreds of "range select out of bounds" warnings on dmem_req.
+    localparam int SLOT_IDX_W = $clog2(N_SLOT);
+
+    logic [N_CACHE-1:0][SLOT_IDX_W-1:0] slot_free;  // first free slot (skid full only if !wready)
+    logic [N_CACHE-1:0][SLOT_IDX_W-1:0] slot_lookup_sel;  // slot to launch the lookup for
+    logic [N_CACHE-1:0][SLOT_IDX_W-1:0] slot_rsp_sel;  // slot the tag answer belongs to
+    logic [N_CACHE-1:0][SLOT_IDX_W-1:0] slot_miss_sel;  // oldest slot the FSM will pick up
+    logic [N_CACHE-1:0] slot_miss_wait;  // a slot awaits FSM pickup
+    logic [N_CACHE-1:0][2:0] slot_outstanding;  // occupied slots + queue entries
 
     // Victim state for a missed slot, captured at its lookup pulse (the only
     // cycle the tag answers are guaranteed current — a later lookup on the
     // tag macro overwrites rdata_q). Round-robin victim selection per set:
     // prefer an invalid way, else the rr pointer, which advances on every
     // miss of that set.
-    logic [N_SETS-1:0] rr_q[N_CACHE];
-    logic [NBIT_WAY-1:0] victim_way_q[N_CACHE][N_SLOT];
-    logic victim_valid_q[N_CACHE][N_SLOT];
-    logic victim_dirty_q[N_CACHE][N_SLOT];
-    logic [TAG_FIELD_W-1:0] victim_tag_q[N_CACHE][N_SLOT];
+    logic [N_CACHE-1:0][N_SETS-1:0] rr_q;
+    logic [N_CACHE-1:0][N_SLOT-1:0][NBIT_WAY-1:0] victim_way_q;
+    logic [N_CACHE-1:0][N_SLOT-1:0] victim_valid_q;
+    logic [N_CACHE-1:0][N_SLOT-1:0] victim_dirty_q;
+    logic [N_CACHE-1:0][N_SLOT-1:0][TAG_FIELD_W-1:0] victim_tag_q;
 
-    int rsp_set[N_CACHE];  // set of the slot whose lookup answer is arriving
-    int rsp_victim_way[N_CACHE];  // victim way chosen for that answer
+    logic [N_CACHE-1:0][NBIT_SET_IDX-1:0]
+        rsp_set;  // set of the slot whose lookup answer is arriving
+    logic [N_CACHE-1:0][NBIT_WAY-1:0] rsp_victim_way;  // victim way chosen for that answer
 
     // Miss-FSM macro access + unstall handshake with the skid/queue logic
     // above. All are driven by the FSM section below (or the store-hit path
     // next to it); declared here so the macro request muxes and the skid
     // always_ff can reference them.
-    logic fsm_lookup_gate[N_CACHE];  // FSM owns this cache's macros: hold lookups
-    logic fsm_unstall[N_CACHE];  // completed miss frees its slot (one cycle)
+    logic [N_CACHE-1:0] fsm_lookup_gate;  // FSM owns this cache's macros: hold lookups
+    logic [N_CACHE-1:0] fsm_unstall;  // completed miss frees its slot (one cycle)
     logic [$clog2(N_SLOT)-1:0] fsm_unstall_slot;  // slot being unstalled
-    logic fsm_rsp_push[N_CACHE];  // completed miss was a load: push its response
+    logic [N_CACHE-1:0] fsm_rsp_push;  // completed miss was a load: push its response
     logic [MEM_WIDTH-1:0] fsm_rsp_data;  // response data from the refilled line
-    int fsm_victim_way;  // victim way the FSM operates on
+    logic [NBIT_WAY-1:0] fsm_victim_way;  // victim way the FSM operates on
     way_req_t fsm_way_req;  // FSM request to the data macros
     tag_req_t fsm_tag_req;  // FSM request to the tag macros
     logic fsm_imem_access, fsm_dmem_access;  // FSM drives the data macros
@@ -238,7 +319,7 @@ module cache_cntrl #(
     logic [DATA_WIDTH-1:0] commit_line;  // refilled line (+ store merge)
     logic miss_is_store;  // the missed request is a store (write-allocate)
     logic dcache_store_hit;  // posted store hit: data+tag writes land now
-    int dhit_way;  // hit way of the store above
+    logic [NBIT_WAY-1:0] dhit_way;  // hit way of the store above
     way_req_t dstore_way_req;
     tag_req_t dstore_tag_req;
 
@@ -266,25 +347,24 @@ module cache_cntrl #(
             // Outstanding units: occupied skid slots plus unconsumed queue
             // entries. Every accepted read stays exactly one unit until the
             // CPU consumes it, so the queue can never overflow SKID_DEPTH.
-            slot_outstanding[c] = (skid_valid_q[c][0] ? 1 : 0) + (skid_valid_q[c][1] ? 1 : 0) +
-                32'(rq_cnt_q[c]);
+            slot_outstanding[c] = 3'(skid_valid_q[c][0]) + 3'(skid_valid_q[c][1]) + 3'(rq_cnt_q[c]);
 
             // Context of the lookup answer arriving this cycle (if any):
             // its set and the victim way chosen for it. The tag macros'
             // rdata is only current while their rvalid pulses, so both are
             // consumed by the miss-pulse capture below, never sampled cold.
-            rsp_set[c] = 32'(skid_q[c][slot_rsp_sel[c]].addr[NBIT_OFFSET+:NBIT_SET_IDX]);
-            rsp_victim_way[c] = 32'(rr_q[c][rsp_set[c]]);
+            rsp_set[c] = skid_q[c][slot_rsp_sel[c]].addr[NBIT_OFFSET+:NBIT_SET_IDX];
+            rsp_victim_way[c] = NBIT_WAY'(rr_q[c][rsp_set[c]]);
             for (int i = N_WAY - 1; i >= 0; i--) begin
                 if ((c == 0) ? !itag_rsp[i].rdata[0] : !dtag_rsp[i].rdata[0]) begin
-                    rsp_victim_way[c] = i;
+                    rsp_victim_way[c] = NBIT_WAY'(i);
                 end
             end
         end
     end
 
     // The address split runs off the skid slot being launched (see skid_q).
-    mem_req_t cache_req[N_CACHE];
+    mem_req_t [N_CACHE-1:0] cache_req;
 
     always_comb begin
         for (int c = 0; c < N_CACHE; c++) cache_req[c] = skid_q[c][slot_lookup_sel[c]];
@@ -292,7 +372,7 @@ module cache_cntrl #(
 
     // Lookup issue: exactly one tag+data macro lookup per accepted request
     // (slot_lookup_q gates relaunch while the CPU holds rready=1).
-    logic cache_lookup_go[N_CACHE];
+    logic [N_CACHE-1:0] cache_lookup_go;
 
     always_comb begin
         for (int c = 0; c < N_CACHE; c++) begin
@@ -311,8 +391,8 @@ module cache_cntrl #(
     // One response pulse per lookup: itag_rsp/dtag_rsp rvalid are identical
     // across ways (same broadcast lookup, same native_ram latency), so way 0
     // is a valid representative.
-    logic cache_rsp_pulse[N_CACHE];
-    logic cache_hit_pulse[N_CACHE];
+    logic [N_CACHE-1:0] cache_rsp_pulse;
+    logic [N_CACHE-1:0] cache_hit_pulse;
     assign cache_rsp_pulse[0] = itag_rsp[0].rvalid;
     assign cache_rsp_pulse[1] = dtag_rsp[0].rvalid;
     assign cache_hit_pulse[0] = cache_rsp_pulse[0] && icache_hit;
@@ -343,7 +423,16 @@ module cache_cntrl #(
     // Module declarations
     // ===================================================================
 
-    // Bootrom 2 KiB
+    // Bootrom 2 KiB.
+    //
+    // TODO: no CPU-side fetch mux exists yet, so nothing issues bootrom
+    // requests. The port is tied off explicitly rather than left floating
+    // — an undriven net is a Gowin EX1998 warning and an X source in a
+    // non-2-state simulator. With a constant-0 request the macro has no
+    // observable output, so synthesis prunes it; it comes back the moment
+    // the fetch mux drives bootr_req.
+    assign bootr_req = '0;
+
     native_ram #(
         .ADDR_W    (11),         // 2 KiB
         .DATA_WIDTH(MEM_WIDTH),
@@ -360,6 +449,14 @@ module cache_cntrl #(
     // looked up in parallel on every request. Data macros are WAY_ADDR_W
     // wide (halved vs. a single direct-mapped macro at N_WAY=2); tag
     // macros are TAG_ADDR_W wide (one tag word per set, see TAG_ADDR_W).
+    //
+    // All eight are BYTE_WRITE(0): every write here commits a whole word.
+    // Gowin BSRAM has no byte write enable, so a byte-writable 256-bit
+    // line macro is built out of 32 byte-wide blocks instead of 8 —
+    // 128 blocks for the four data macros alone, against 46 on the
+    // GW2AR-18 (synthesis error RP0002). The only partial write in the
+    // design is the D-cache store hit, and that path merges into the line
+    // it has already read out (see dstore_way_req below).
     genvar w;
     generate
         for (w = 0; w < N_WAY; w++) begin : gen_way
@@ -370,6 +467,7 @@ module cache_cntrl #(
                 .REQ_T     (way_req_t),
                 .RSP_T     (way_rsp_t),
                 .READ_ONLY (0),
+                .BYTE_WRITE(0),           // whole-line writes only, see the store-hit merge
                 .INIT_FILE ("")
             ) u_icache (
                 .clk_i    (clk_i),
@@ -384,6 +482,7 @@ module cache_cntrl #(
                 .REQ_T     (way_req_t),
                 .RSP_T     (way_rsp_t),
                 .READ_ONLY (0),
+                .BYTE_WRITE(0),           // whole-line writes only, see the store-hit merge
                 .INIT_FILE ("")
             ) u_dcache (
                 .clk_i    (clk_i),
@@ -398,6 +497,7 @@ module cache_cntrl #(
                 .REQ_T     (tag_req_t),
                 .RSP_T     (tag_rsp_t),
                 .READ_ONLY (0),
+                .BYTE_WRITE(0),           // whole-line writes only, see the store-hit merge
                 .INIT_FILE ("")
             ) u_itag (
                 .clk_i    (clk_i),
@@ -412,6 +512,7 @@ module cache_cntrl #(
                 .REQ_T     (tag_req_t),
                 .RSP_T     (tag_rsp_t),
                 .READ_ONLY (0),
+                .BYTE_WRITE(0),           // whole-line writes only, see the store-hit merge
                 .INIT_FILE ("")
             ) u_dtag (
                 .clk_i    (clk_i),
@@ -423,18 +524,58 @@ module cache_cntrl #(
         end
     endgenerate
 
+    // ===================================================================
+    // Tag invalidation sweep
+    //
+    // A cache may not trust the state its tag memory wakes up in. Nothing
+    // in this design ever cleared the valid bits: simulation passed only
+    // because an uninitialised array reads as zero there, and the board
+    // was relying on whatever the tool happens to do with BSRAM contents
+    // at configuration. In a 4-state gate-level run the same tags read X,
+    // the hit/miss decision became X, and the X reached the skid slot's
+    // valid bit and wedged the port — which is the failure the board
+    // shows.
+    //
+    // So: after reset, walk every set and write valid=0 into every way of
+    // both caches (the four tag macros are independent, so one set per
+    // cycle covers all of them), and hold both ports' wready low until the
+    // sweep is done. N_SETS cycles, once, at reset.
+    // ===================================================================
+    logic [NBIT_SET_IDX:0] tag_init_cnt_q;
+    wire tag_init_done = tag_init_cnt_q[NBIT_SET_IDX];
+    wire [NBIT_SET_IDX-1:0] tag_init_set = tag_init_cnt_q[NBIT_SET_IDX-1:0];
+
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) tag_init_cnt_q <= '0;
+        else if (!tag_init_done) tag_init_cnt_q <= tag_init_cnt_q + 1'b1;
+    end
+
+    // SDRAM power-up hold: the controller's reset is released only after
+    // SDRAM_INIT_US of stable clock (see the parameter). The counter is
+    // sized from the same CLK_FREQ_MHZ that spaces the refreshes, so both
+    // follow the real clock rate.
+    localparam int INIT_WAIT_CYCLES = CLK_FREQ_MHZ * SDRAM_INIT_US;
+    localparam int INIT_CNT_W = $clog2(INIT_WAIT_CYCLES + 1);
+
+    logic [INIT_CNT_W-1:0] init_cnt_q;
+    wire init_done = (init_cnt_q == INIT_CNT_W'(INIT_WAIT_CYCLES));
+    wire sdrc_rstn = rstn_i && init_done;
+
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) init_cnt_q <= '0;
+        else if (!init_done) init_cnt_q <= init_cnt_q + 1'b1;
+    end
+
     // SDRAM controller (src/ips/sdram-controller submodule, BSD; the
     // gw2ar-32bit branch adapts it to the GW2AR-18 embedded SDRAM: 32-bit
     // data, row/col/bank 11/8/2, CL=3, burst length 1 with auto-precharge
     // — one host word per transaction, refresh handled internally).
-    // TODO (FPGA): pick the real system clock + CLK_FREQUENCY (refresh
-    // spacing) and the O_sdram_clk phase alignment.
     sdram_controller #(
         .ROW_WIDTH    (11),
         .COL_WIDTH    (8),
         .BANK_WIDTH   (2),
         .DATA_WIDTH   (32),
-        .CLK_FREQUENCY(100)
+        .CLK_FREQUENCY(CLK_FREQ_MHZ)
     ) u_sdram_cntrl (
         .wr_addr     (sdram_wr_addr),
         .wr_data     (sdram_wr_data),
@@ -444,7 +585,7 @@ module cache_cntrl #(
         .rd_ready    (sdram_rd_ready),
         .rd_enable   (sdram_rd_en),
         .busy        (sdram_busy),
-        .rst_n       (rstn_i),
+        .rst_n       (sdrc_rstn),
         .clk         (clk_i),
         .addr        (sdram_addr_o),
         .bank_addr   (sdram_ba_o),
@@ -457,7 +598,7 @@ module cache_cntrl #(
         .dqm         (sdram_dqm_o)
     );
 
-    assign sdram_clk_o = clk_i;
+    assign sdram_clk_o = sdram_clk_i;
 
 
     // ===================================================================
@@ -497,6 +638,27 @@ module cache_cntrl #(
                 {(MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}}, set_idx[1], {TAG_BYTES_W{1'b0}}
             };
             dtag_req[i].rready = 1'b1;
+        end
+
+        // Invalidation sweep owns the tag macros until it is done. It runs
+        // before any request can be accepted (wready is low), so nothing
+        // else is driving them here.
+        if (!tag_init_done) begin
+            for (int i = 0; i < N_WAY; i++) begin
+                itag_req[i] = '0;
+                itag_req[i].valid = 1'b1;
+                itag_req[i].we = 1'b1;
+                itag_req[i].addr = {
+                    {(MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}},
+                    tag_init_set,
+                    {TAG_BYTES_W{1'b0}}
+                };
+                itag_req[i].wdata = '0;  // valid = 0, dirty = 0, tag = 0
+                itag_req[i].wstrb = {(TAG_DATA_W / 8) {1'b1}};
+                itag_req[i].rready = 1'b1;
+
+                dtag_req[i] = itag_req[i];
+            end
         end
 
         // Miss-FSM tag write (S_UPDATE_TAG): store the refilled line's tag
@@ -614,28 +776,28 @@ module cache_cntrl #(
     //               as outstanding the whole time, so wready stays low on
     //               the single-outstanding D-port.
     // -------------------------------------------------------------
-    logic cache_accept[N_CACHE];
+    logic [N_CACHE-1:0] cache_accept;
     assign cache_accept[0] = icache_req_i.valid && icache_rsp_o.wready;
     assign cache_accept[1] = dcache_req_i.valid && dcache_rsp_o.wready;
 
     // CPU consumed the queue head.
-    logic cache_pop[N_CACHE];
+    logic [N_CACHE-1:0] cache_pop;
     assign cache_pop[0] = icache_req_i.rready && icache_rsp_o.rvalid;
     assign cache_pop[1] = dcache_req_i.rready && dcache_rsp_o.rvalid;
 
     // Queue push: the tag answer was a load hit.
-    logic cache_push[N_CACHE];
+    logic [N_CACHE-1:0] cache_push;
     assign cache_push[0] = cache_rsp_pulse[0] && cache_hit_pulse[0] && !cmp_we_q[0];
     assign cache_push[1] = cache_rsp_pulse[1] && cache_hit_pulse[1] && !cmp_we_q[1];
 
-    logic [MEM_WIDTH-1:0] cache_push_data[N_CACHE];
+    logic [N_CACHE-1:0][MEM_WIDTH-1:0] cache_push_data;
     assign cache_push_data[0] = icache_push_data;
     assign cache_push_data[1] = dcache_push_data;
 
     // An unresolved miss (pending pickup or owned by the FSM) older than
     // the entry being pushed blocks that entry: responses must be delivered
     // in accept order (the fetch unit's instruction buffer relies on it).
-    logic older_miss[N_CACHE];
+    logic [N_CACHE-1:0] older_miss;
     assign older_miss[0] = (|slot_miss_q[0]) || slot_miss_wait[0];
     assign older_miss[1] = (|slot_miss_q[1]) || slot_miss_wait[1];
 
@@ -810,6 +972,66 @@ module cache_cntrl #(
 
     fsm_state_e state_q, state_d;
 
+    assign dbg_state_o = state_q;
+
+    // D-cache event counters (see dbg_cnt_o). Saturating: a stuck port is
+    // identified by the first count that stops advancing, so wrapping
+    // would destroy exactly the information wanted.
+    // syn_preserve / syn_keep: these are probes, and a probe the optimiser
+    // is allowed to fold into a constant reports the optimiser's opinion
+    // instead of the hardware's behaviour. On the board every one of them
+    // read zero while the state they count said the events had happened,
+    // so they are pinned here and the next build says whether the freeze
+    // is in the design or in what synthesis did to it.
+    (* syn_preserve = 1 *)
+    (* syn_keep = 1 *)
+    logic [3:0] cnt_lookup_q, cnt_pulse_q, cnt_miss_q, cnt_unstall_q, cnt_acc_q;
+    (* syn_preserve = 1 *) (* syn_keep = 1 *)
+    logic [24:0] tick_q;
+
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) begin
+            cnt_lookup_q  <= '0;
+            cnt_pulse_q   <= '0;
+            cnt_miss_q    <= '0;
+            cnt_unstall_q <= '0;
+            cnt_acc_q     <= '0;
+            tick_q        <= '0;
+        end else begin
+            tick_q <= tick_q + 1'b1;
+            if (cache_accept[1] && !(&cnt_acc_q)) cnt_acc_q <= cnt_acc_q + 1'b1;
+            if (cache_lookup_go[1] && !(&cnt_lookup_q)) cnt_lookup_q <= cnt_lookup_q + 1'b1;
+            if (cache_rsp_pulse[1] && !(&cnt_pulse_q)) cnt_pulse_q <= cnt_pulse_q + 1'b1;
+            if ((state_q == S_IDLE) && miss_pending && miss_sel && !(&cnt_miss_q))
+                cnt_miss_q <= cnt_miss_q + 1'b1;
+            if (fsm_unstall[1] && !(&cnt_unstall_q)) cnt_unstall_q <= cnt_unstall_q + 1'b1;
+        end
+    end
+
+    assign dbg_cnt_o = {cnt_unstall_q, cnt_miss_q, cnt_pulse_q, cnt_lookup_q};
+    assign dbg_acc_o = cnt_acc_q;
+    // Bits chosen so the field changes between two report lines at both
+    // rates in use: every 4096 clocks is ~82 us on the board and ~41 us in
+    // simulation, both far shorter than a report period.
+    // Bits 15:12 tick every 4096 clocks. NOT a multiple of the reporter's
+    // period, which is what the first version got wrong: it exported
+    // tick_q[15:12] while the reporter sampled every 2**24 clocks, an exact
+    // multiple of that field's own period, so every sample landed on the
+    // same phase and the field read constant. A constant probe reads
+    // exactly like a dead clock, and it cost three board round-trips.
+    // 5 bits down from the sample period, offset by a prime-ish shift:
+    assign dbg_tick_o = {tick_q[20], tick_q[17], tick_q[14], tick_q[11]};
+    assign dbg_hb_o = tick_q[24];
+    assign dbg_go_o = {
+        cache_lookup_go[1], fsm_lookup_gate[1], dtag_req[0].valid, dtag_rsp[0].wready
+    };
+    assign dbg_rsp_o = {
+        dtag_rsp[0].rvalid, dmem_rsp_d[0].rvalid, slot_rsp_q[1][0], slot_rsp_q[1][1]
+    };
+    assign dbg_dport_o = {
+        skid_valid_q[1][0], slot_lookup_q[1][0], miss_seen_q[1][0], rq_cnt_q[1] != 2'd0
+    };
+
     logic req_sel_q, req_sel_d;  // 0 = icache, 1 = dcache
     logic [3:0] burst_cnt_q, burst_cnt_d;  // 0 .. BURST_LEN-1
     logic [DATA_WIDTH-1:0] line_buf_q, line_buf_d;  // staged/assembled cache line
@@ -818,7 +1040,7 @@ module cache_cntrl #(
 
     logic miss_pending;
     logic miss_sel;  // 0 = icache, 1 = dcache (the entry the FSM will pick up)
-    logic cache_fsm_latch[N_CACHE];
+    logic [N_CACHE-1:0] cache_fsm_latch;
 
     // A miss is pending from its lookup's response until the FSM latches it
     // (miss_seen_q is a one-shot per request, not a per-cycle level — the
@@ -1016,7 +1238,7 @@ module cache_cntrl #(
     // (req_sel_q). Lookups on that cache are gated while these are active,
     // so the muxes in the macro request blocks never arbitrate two drivers.
     always_comb begin
-        fsm_victim_way  = 32'(victim_way_q[req_sel_q][miss_slot_q]);
+        fsm_victim_way  = victim_way_q[req_sel_q][miss_slot_q];
         fsm_way_req     = '0;
         fsm_tag_req     = '0;
         fsm_imem_access = 1'b0;
@@ -1110,29 +1332,42 @@ module cache_cntrl #(
     // -------------------------------------------------------------
     // D-cache store hit (posted). The data-macro write into the hit way and
     // the dirty-bit tag write fire the same cycle the tag answer pulses.
-    // Byte strobes are positioned at the store's doubleword
-    // (cmp_dw_sel_q), so only the addressed bytes of the line are touched;
-    // the rest of the wdata is don't-care (strobed off). The I-port is
-    // read-only by spec: a we=1 request there is a posted no-op.
+    //
+    // The write is a READ-MODIFY-WRITE of the whole line, not a
+    // byte-strobed one: the data macros are BYTE_WRITE(0) (byte enables
+    // cost 4x the BSRAM blocks on this device, see the macro
+    // instantiation above). The line being modified is already on the
+    // macro's registered output this very cycle — dcache_line, the hit
+    // way's rdata — so merging the stored bytes into it costs no extra
+    // cycle and no extra port. Only the bytes the store strobes at its
+    // doubleword (cmp_dw_sel_q) change; every other byte is written back
+    // with the value just read. The I-port is read-only by spec: a we=1
+    // request there is a posted no-op.
     // -------------------------------------------------------------
     assign dcache_store_hit = cache_rsp_pulse[1] && cache_hit_pulse[1] && cmp_we_q[1];
 
     always_comb begin
-        dhit_way = 0;
+        dhit_way = '0;
         for (int i = N_WAY - 1; i >= 0; i--) begin
-            if (dcache_way_hit[i]) dhit_way = i;
+            if (dcache_way_hit[i]) dhit_way = NBIT_WAY'(i);
         end
     end
 
     always_comb begin
-        dstore_way_req = '0;
+        dstore_way_req       = '0;
         dstore_way_req.valid = dcache_store_hit;
-        dstore_way_req.we = 1'b1;
-        dstore_way_req.addr = skid_q[1][slot_rsp_sel[1]].addr;
-        dstore_way_req.wdata = '0;
-        dstore_way_req.wdata[cmp_dw_sel_q[1]*64+:64] = skid_q[1][slot_rsp_sel[1]].wdata;
-        dstore_way_req.wstrb = {{(DATA_WIDTH / 8 - MEM_WIDTH / 8) {1'b0}},
-                                skid_q[1][slot_rsp_sel[1]].wstrb} << (cmp_dw_sel_q[1] * 8);
+        dstore_way_req.we    = 1'b1;
+        dstore_way_req.addr  = skid_q[1][slot_rsp_sel[1]].addr;
+        // Start from the line as it stands in the hit way, then overwrite
+        // only the strobed bytes of the addressed doubleword.
+        dstore_way_req.wdata = dcache_line;
+        for (int b = 0; b < MEM_WIDTH / 8; b++) begin
+            if (skid_q[1][slot_rsp_sel[1]].wstrb[b]) begin
+                dstore_way_req.wdata[cmp_dw_sel_q[1]*64+b*8+:8] =
+                    skid_q[1][slot_rsp_sel[1]].wdata[b*8+:8];
+            end
+        end
+        dstore_way_req.wstrb = {(DATA_WIDTH / 8) {1'b1}};
         dstore_way_req.rready = 1'b1;
 
         dstore_tag_req = '0;
@@ -1164,12 +1399,12 @@ module cache_cntrl #(
     //   served while the miss FSM is mid-transit; only unresolved-miss
     //   slots gate delivery.
     // -------------------------------------------------------------
-    assign icache_rsp_o.wready = (slot_outstanding[0] < SKID_DEPTH[0]);
+    assign icache_rsp_o.wready = tag_init_done && (slot_outstanding[0] < 3'(SKID_DEPTH[0]));
     assign icache_rsp_o.rvalid = (rq_cnt_q[0] != 2'd0) && !rq_blk_q[0][0];
     assign icache_rsp_o.rdata  = rq_q[0][0];
     assign icache_rsp_o.bvalid = 1'b0;  // posted stores, no B channel
 
-    assign dcache_rsp_o.wready = (slot_outstanding[1] < SKID_DEPTH[1]);
+    assign dcache_rsp_o.wready = tag_init_done && (slot_outstanding[1] < 3'(SKID_DEPTH[1]));
     assign dcache_rsp_o.rvalid = (rq_cnt_q[1] != 2'd0) && !rq_blk_q[1][0];
     assign dcache_rsp_o.rdata  = rq_q[1][0];
     assign dcache_rsp_o.bvalid = 1'b0;  // posted stores, no B channel
