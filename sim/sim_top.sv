@@ -65,7 +65,9 @@ module sim_top;
     wire      [ 1:0] sdram_ba_o;
     wire      [31:0] sdram_dq_io;
 
-    cache_cntrl u_dut (
+    cache_cntrl #(
+        .BOOTROM_FILE("bootrom.hex")
+    ) u_dut (
         .clk_i        (clk),
         .rstn_i       (rstn),
         .sdram_clk_i  (clk),
@@ -267,11 +269,94 @@ module sim_top;
 
     // Watchdog budget: the 200 us SDRAM power-up wait (20 000 cycles at
     // this 100 MHz clock) plus the test itself.
-    localparam int N_CYCLES = 30000;
+    localparam int N_CYCLES = 40000;
     integer error_count;
     integer wait_rsp;
     integer wait_fsm;
     logic   saw_fsm;
+
+    // Scratch for the handshaking phases (R/X/Y/Z) below.
+    logic [63:0] rd_d, rd_i;
+    logic ok_d, ok_i;
+
+    // Bootrom image (sim/bootrom.hex): word i = {B007_0000+i, C0DE_0000+i}.
+    function automatic logic [63:0] boot_word(input int i);
+        boot_word = {32'hB007_0000 + 32'(i), 32'hC0DE_0000 + 32'(i)};
+    endfunction
+
+    // SDRAM byte address of a doubleword, as the CPU sees it.
+    function automatic logic [63:0] a64(input logic [23:0] a);
+        a64 = {{(64 - 24) {1'b0}}, a};
+    endfunction
+
+    // -----------------------------------------------------------------
+    // Port drivers. The phases below mix cached, uncached and bypassed
+    // accesses whose latencies differ by two orders of magnitude, so they
+    // handshake instead of counting cycles: assert until wready, one edge
+    // to be accepted, then wait for the response (a load) or for the port
+    // to go idle again (a posted store).
+    // -----------------------------------------------------------------
+    task automatic d_access(input logic [63:0] addr, input logic we, input logic [63:0] wdata,
+                            input logic [7:0] wstrb, output logic [63:0] rdata, output logic ok);
+        int guard;
+        dcache_req.valid  = 1'b1;
+        dcache_req.we     = we;
+        dcache_req.addr   = addr;
+        dcache_req.wdata  = wdata;
+        dcache_req.wstrb  = wstrb;
+        dcache_req.rready = 1'b1;
+        guard             = 0;
+        while (!dcache_rsp.wready && guard < 2000) begin
+            @(posedge clk);
+            guard = guard + 1;
+        end
+        @(posedge clk);  // accepted at this edge
+        dcache_req.valid = 1'b0;
+        dcache_req.we    = 1'b0;
+        rdata            = '0;
+        ok               = 1'b0;
+        guard            = 0;
+        if (we) begin
+            while (!dcache_rsp.wready && guard < 2000) begin
+                @(posedge clk);
+                guard = guard + 1;
+            end
+            ok = dcache_rsp.wready;
+        end else begin
+            while (!dcache_rsp.rvalid && guard < 2000) begin
+                @(posedge clk);
+                guard = guard + 1;
+            end
+            ok    = dcache_rsp.rvalid;
+            rdata = dcache_rsp.rdata;
+            @(posedge clk);  // rready is high: the head pops here
+        end
+    endtask
+
+    task automatic i_load(input logic [63:0] addr, output logic [63:0] rdata, output logic ok);
+        int guard;
+        icache_req.valid  = 1'b1;
+        icache_req.we     = 1'b0;
+        icache_req.addr   = addr;
+        icache_req.rready = 1'b1;
+        guard             = 0;
+        while (!icache_rsp.wready && guard < 2000) begin
+            @(posedge clk);
+            guard = guard + 1;
+        end
+        @(posedge clk);
+        icache_req.valid = 1'b0;
+        rdata            = '0;
+        ok               = 1'b0;
+        guard            = 0;
+        while (!icache_rsp.rvalid && guard < 2000) begin
+            @(posedge clk);
+            guard = guard + 1;
+        end
+        ok    = icache_rsp.rvalid;
+        rdata = icache_rsp.rdata;
+        @(posedge clk);
+    endtask
 
     initial begin
         error_count = 0;
@@ -816,6 +901,123 @@ module sim_top;
             $display("PASS  V4: store miss write-allocated + merged (rdata=%h)", dcache_rsp.rdata);
         end
         dcache_req.valid = 1'b0;
+
+        // ---- Phase R: bootrom (0x80_0000, read-only, both ports).
+        // The image is sim/bootrom.hex; word i sits at BOOTROM_BASE + 8*i.
+        // ----
+        d_access(a64(24'h80_0000 + 24'd16), 1'b0, '0, 8'h00, rd_d, ok_d);
+        if (!ok_d || rd_d !== boot_word(2)) begin
+            error_count = error_count + 1;
+            $display("FAIL  R1: bootrom D-port read (ok=%b expected %h got %h)", ok_d, boot_word(2
+                     ), rd_d);
+        end else begin
+            $display("PASS  R1: bootrom read on the D port (rdata=%h)", rd_d);
+        end
+
+        i_load(a64(24'h80_0000 + 24'd40), rd_i, ok_i);
+        if (!ok_i || rd_i !== boot_word(5)) begin
+            error_count = error_count + 1;
+            $display("FAIL  R2: bootrom I-port read (ok=%b expected %h got %h)", ok_i, boot_word(5
+                     ), rd_i);
+        end else begin
+            $display("PASS  R2: bootrom read on the I port (rdata=%h)", rd_i);
+        end
+
+        // Both ports at once: the bootrom is ONE macro, so the two
+        // requests are arbitrated. Both answers must still be right.
+        fork
+            i_load(a64(24'h80_0000 + 24'd8), rd_i, ok_i);
+            d_access(a64(24'h80_0000 + 24'd2040), 1'b0, '0, 8'h00, rd_d, ok_d);
+        join
+        if (!ok_i || rd_i !== boot_word(1) || !ok_d || rd_d !== boot_word(255)) begin
+            error_count = error_count + 1;
+            $display("FAIL  R3: arbitrated bootrom reads (I ok=%b %h, D ok=%b %h)", ok_i, rd_i,
+                     ok_d, rd_d);
+        end else begin
+            $display("PASS  R3: simultaneous bootrom reads arbitrated (I=%h D=%h)", rd_i, rd_d);
+        end
+
+        // A store to the ROM must retire without changing it.
+        d_access(a64(24'h80_0000 + 24'd16), 1'b1, 64'hDEAD_BEEF_DEAD_BEEF, 8'hFF, rd_d, ok_d);
+        d_access(a64(24'h80_0000 + 24'd16), 1'b0, '0, 8'h00, rd_d, ok_d);
+        if (!ok_d || rd_d !== boot_word(2)) begin
+            error_count = error_count + 1;
+            $display("FAIL  R4: store to the bootrom changed it (got %h)", rd_d);
+        end else begin
+            $display("PASS  R4: store to the bootrom is a posted no-op");
+        end
+
+        // ---- Phase X: control register (0x80_1000, 8 bit, RW). ----
+        d_access(a64(24'h80_1000), 1'b0, '0, 8'h00, rd_d, ok_d);
+        if (!ok_d || rd_d !== 64'd0) begin
+            error_count = error_count + 1;
+            $display("FAIL  X1: control register reset value (ok=%b got %h)", ok_d, rd_d);
+        end else begin
+            $display("PASS  X1: control register reads 0 out of reset");
+        end
+
+        d_access(a64(24'h80_1000), 1'b1, 64'h0000_0000_0000_00A5, 8'h01, rd_d, ok_d);
+        d_access(a64(24'h80_1000), 1'b0, '0, 8'h00, rd_d, ok_d);
+        if (!ok_d || rd_d !== 64'h0000_0000_0000_00A5) begin
+            error_count = error_count + 1;
+            $display("FAIL  X2: control register write/read back (got %h)", rd_d);
+        end else begin
+            $display("PASS  X2: control register write/read back (%h)", rd_d);
+        end
+
+        // ---- Phase Y: cache bypass, loads.
+        // Address 0 is DIRTY in the D-cache (Phase S stored STORE_VAL into
+        // it and nothing has evicted set 0 since), so SDRAM still holds the
+        // power-on pattern there. With CACHE_BYPASS set the load must
+        // return what the DEVICE holds, not what the cache holds — which
+        // is exactly the distinction the bit exists to make.
+        // ----
+        d_access(a64(24'h80_1000), 1'b1, 64'd1, 8'h01, rd_d, ok_d);  // bypass on
+
+        d_access(a64(24'h00_0000), 1'b0, '0, 8'h00, rd_d, ok_d);
+        if (!ok_d || rd_d !== sdram_line_dw0(23'h00_0000)) begin
+            error_count = error_count + 1;
+            $display("FAIL  Y1: bypass load (ok=%b expected %h got %h)", ok_d, sdram_line_dw0(
+                     23'h00_0000), rd_d);
+        end else begin
+            $display("PASS  Y1: bypass load read the device, not the dirty line (%h)", rd_d);
+        end
+
+        // ---- Phase Z: cache bypass, stores.
+        // Z1 strobes all 8 bytes (the FSM skips the read-modify-write),
+        // Z2 strobes one byte of the upper word (it cannot: the controller
+        // drives dqm itself, so the word is read back, merged, rewritten).
+        // ----
+        d_access(a64(24'h60_0000), 1'b1, 64'h0011_2233_4455_6677, 8'hFF, rd_d, ok_d);
+        d_access(a64(24'h60_0000), 1'b0, '0, 8'h00, rd_d, ok_d);
+        if (!ok_d || rd_d !== 64'h0011_2233_4455_6677) begin
+            error_count = error_count + 1;
+            $display("FAIL  Z1: bypass full-word store round-trip (got %h)", rd_d);
+        end else begin
+            $display("PASS  Z1: bypass store round-tripped through the device (%h)", rd_d);
+        end
+
+        d_access(a64(24'h60_0000), 1'b1, 64'h00EE_0000_0000_0000, 8'h40, rd_d, ok_d);
+        d_access(a64(24'h60_0000), 1'b0, '0, 8'h00, rd_d, ok_d);
+        if (!ok_d || rd_d !== 64'h00EE_2233_4455_6677) begin
+            error_count = error_count + 1;
+            $display("FAIL  Z2: bypass partial store merge (expected %h got %h)",
+                     64'h00EE_2233_4455_6677, rd_d);
+        end else begin
+            $display("PASS  Z2: bypass partial store read-modify-wrote the word (%h)", rd_d);
+        end
+
+        // Bypass off again: the same address 0 must go back to answering
+        // out of the (still dirty) cache line.
+        d_access(a64(24'h80_1000), 1'b1, 64'd0, 8'h01, rd_d, ok_d);
+        d_access(a64(24'h00_0000), 1'b0, '0, 8'h00, rd_d, ok_d);
+        if (!ok_d || rd_d !== EXP_PARTIAL) begin
+            error_count = error_count + 1;
+            $display("FAIL  Z3: cached load after clearing bypass (expected %h got %h)",
+                     EXP_PARTIAL, rd_d);
+        end else begin
+            $display("PASS  Z3: clearing bypass restores the cached path (%h)", rd_d);
+        end
 
         // The SDRAM model counts protocol violations (power-up window, MRS
         // before access, tRP / tRFC / tRCD). They are failures: a run that

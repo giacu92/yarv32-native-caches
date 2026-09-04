@@ -30,14 +30,20 @@ module fpga_top #(
     // cannot override these — they are baked in here instead, at the same
     // fast values the RTL testbench passes.
     parameter int UART_BAUD = 12_500_000,
-    parameter int UART_PERIOD_W = 9
+    parameter int UART_PERIOD_W = 9,
 `else
     // Debug UART baud. 115200 on the board; the testbench overrides it to
     // something far faster so a whole line fits in a short simulation.
     parameter int UART_BAUD = 115_200,
     // Status line period, 2**UART_PERIOD_W clocks (~0.34 s at 50 MHz).
-    parameter int UART_PERIOD_W = 24
+    parameter int UART_PERIOD_W = 24,
 `endif
+    // $readmemh image for the bootrom macro (2 KiB, 256 x 64 bit), mapped
+    // at BOOTROM_BASE. Empty until there is boot code to put in it: the
+    // macro is wired to both CPU ports either way, but an uninitialised
+    // read-only array is a constant, and GowinSynthesis is entitled to
+    // build it as one (see native_ram's ram_style comment).
+    parameter string BOOTROM_FILE = ""
 ) (
     // 25 MHz reference clock from the MS5351M clock generator (crystal-fed,
     // CLK0 on PIN10, plain LVCMOS33 — no differential pair).
@@ -230,7 +236,8 @@ module fpga_top #(
     );
 
     cache_cntrl #(
-        .CLK_FREQ_MHZ(CLK_FREQ_MHZ)
+        .CLK_FREQ_MHZ(CLK_FREQ_MHZ),
+        .BOOTROM_FILE(BOOTROM_FILE)
     ) u_cache (
         .clk_i        (clk_core),
         .rstn_i       (rstn_core),

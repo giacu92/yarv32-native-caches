@@ -42,7 +42,7 @@ for tool in sv2v yosys; do
 done
 
 mkdir -p "$OUT"
-sv2v -DVERILATOR --write="$OUT/design.v" "${SOURCES[@]}"
+sv2v -DVERILATOR -DNO_SIM_PLUSARGS --write="$OUT/design.v" "${SOURCES[@]}"
 
 # Noise this check produces and why it is not acted on: sv2v renders the
 # `parameter type REQ_T/RSP_T` ports at their DEFAULT width before yosys

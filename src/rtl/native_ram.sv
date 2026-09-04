@@ -59,7 +59,7 @@ module native_ram #(
     parameter int DATA_WIDTH = 32,
     // Width of the request's addr field (byte address). The RAM decodes
     // only the low ADDR_W bits; extra MSBs are simply not sampled.
-    parameter int REQ_ADDR_W = MEM_WIDTH,
+    parameter int REQ_ADDR_W = yarv32_cache_pkg::MEM_WIDTH,
     // 1 = read-only I-mem (fetch); 0 = read/write D-mem (LSU, byte-strobed).
     parameter bit READ_ONLY = 0,
     // 1 = per-byte write enables (wstrb selects which bytes commit).
@@ -152,20 +152,30 @@ module native_ram #(
     end
 
 `ifdef VERILATOR
+`ifndef NO_SIM_PLUSARGS
     // +RAM_GARBAGE fills the array with junk before time 0. Simulation
     // otherwise hands out zeros for memory nobody wrote, which is how a
     // design that trusts its RAM's power-up state passes here and hangs on
     // a device — the cache's tag valid bits were exactly that bug. A test
     // that passes with this plusarg does not depend on the accident.
+    // NO_SIM_PLUSARGS excludes this block from the sv2v/yosys paths
+    // (`make lint-yosys`, `make gatesim`): they preprocess with
+    // -DVERILATOR to bypass the rPLL, and yosys cannot read either the
+    // $test$plusargs call or sv2v's rendering of a size cast. The random
+    // value goes through a sized variable for the same reason.
+    logic [31:0] garbage_rnd;
+
     initial begin
         if ($test$plusargs("RAM_GARBAGE") && INIT_FILE == "") begin
             for (int gi = 0; gi < DEPTH_WORDS; gi++) begin
                 for (int gb = 0; gb < DATA_W; gb++) begin
-                    mem[gi][gb] = 1'($random());
+                    garbage_rnd = $random();
+                    mem[gi][gb] = garbage_rnd[0];
                 end
             end
         end
     end
+`endif
 `endif
 
     // -----------------------------------------------------------------

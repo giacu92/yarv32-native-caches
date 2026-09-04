@@ -41,7 +41,10 @@ not installed on this machine.
   machine without the Gowin toolchain.
 - `+RAM_GARBAGE` (plusarg) — fill every `native_ram` array with junk before
   time 0 instead of letting simulation hand out zeros for memory nobody
-  wrote. Run it as `make -C sim run RUN_ARGS=+RAM_GARBAGE` (or on the BIST
+  wrote. The block is excluded from the sv2v/yosys paths by
+  `NO_SIM_PLUSARGS` (`scripts/yosys_check.sh`, `scripts/gatesim.sh` pass
+  it): yosys reads neither `$test$plusargs` nor sv2v's rendering of a size
+  cast, and both scripts preprocess with `-DVERILATOR`. Run it as `make -C sim run RUN_ARGS=+RAM_GARBAGE` (or on the BIST
   binary). A test that passes with it does not depend on that accident.
 - `make -C sim xrun` / `xbist` — the same two simulations with Verilator's
   `--x-initial unique`, which randomises uninitialised FLOPS. Note it does
@@ -83,7 +86,8 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
 
 - `src/rtl/cache_cntrl.sv` — top-level cache controller: address split,
   tag RAM wiring, per-way tag compare, miss-handling FSM, SDRAM controller
-  instance.
+  instance, plus the system address decode (bootrom, control register,
+  cache bypass — see "System address map").
 - `src/rtl/native_ram.sv` — generic single-clock BSRAM wrapper implementing
   the native `mem_req_t`/`mem_rsp_t` protocol (see below). Parametrized by
   `ADDR_W`, `DATA_WIDTH`, `READ_ONLY`. Used for bootrom, cache data
@@ -101,6 +105,9 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   to its macro instances — so port widths match at every width, verified by
   elaboration-time `$bits` checks, and a WIDTH lint warning now means a
   real bug (the sim Makefile no longer waives `WIDTH`/`WIDTHEXPAND`).
+- `cache_cntrl` parameters beyond the geometry table below: `BOOTROM_FILE`
+  (the bootrom's `$readmemh` image) and `CSR_RST_VAL` (the control
+  register's power-on value). `fpga_top` forwards `BOOTROM_FILE`.
 - `native_ram` parameters: `ADDR_W`, `DATA_WIDTH`, `REQ_ADDR_W` (addr
   field width, default `MEM_WIDTH`; the RAM decodes only the low `ADDR_W`
   bits), `READ_ONLY`, `BYTE_WRITE`, `INIT_FILE` (optional `$readmemh`
@@ -212,8 +219,16 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   both ways valid), S (posted store hit, read-back, neighboring doubleword
   untouched), V (dirty eviction with both ways valid: round-robin victim,
   writeback to the victim's address, evicted line survives the round-trip)
-  and V4 (store-miss write-allocate with a partial byte strobe merged
-  into the refilled line). Preloads the tag/data macros by hierarchical
+  V4 (store-miss write-allocate with a partial byte strobe merged
+  into the refilled line), R (bootrom reads on each port, both ports at
+  once through the arbiter, and a store to the ROM that must not stick),
+  X (control register reset value, write, read-back), Y (a bypass load of
+  an address whose cached copy is dirty — it must return what the DEVICE
+  holds) and Z (bypass stores, full-word and partial-strobe, round-tripped
+  through the device, then bypass cleared and the cached path checked
+  again). The R/X/Y/Z phases handshake through the `d_access` / `i_load`
+  tasks instead of counting cycles, because they mix latencies that differ
+  by two orders of magnitude. Preloads the tag/data macros by hierarchical
   reference (`u_dut.gen_way[w].u_itag.mem` etc.) at time 0, indexed by the
   plain set index (the DUT applies the `TAG_BYTES_W` shift itself).
 - SDRAM power-up: `cache_cntrl` holds the controller in reset for
@@ -356,9 +371,54 @@ assert in `cache_cntrl` guards the depth). The tag lookup request (`set_idx`) is
 broadcast to all ways in parallel; tag compare and hit detection are fully
 parallel (`N_WAY` comparators per cache), not time-multiplexed.
 
-The bootrom is a 2 KiB (`ADDR_W=11`) read-only `native_ram` instance; with
-no CPU-side fetch mux yet its `bootr_req` is tied off to `'0` and
-`bootr_rsp` is unread, so synthesis prunes it.
+## System address map (24 bit)
+
+The SDRAM needs 23 address bits for its 8 MiB, so bit 23 is free and is
+what separates memory from everything else. `yarv32_cache_pkg` holds the
+map and the `yarv_region` decode; only bits `[23]` and `[12]` are looked
+at, so each peripheral aliases through its 4 KiB window and address bits
+above 23 are ignored.
+
+| Range                 | Target                                     |
+|-----------------------|--------------------------------------------|
+| `0x00_0000-0x7F_FFFF` | SDRAM, 8 MiB, cached (or bypassed)         |
+| `0x80_0000-0x80_07FF` | bootrom, 2 KiB, read-only, both CPU ports  |
+| `0x80_1000`           | control register, 8 bit, read/write        |
+
+The bootrom is a 2 KiB (`ADDR_W = BOOTROM_ADDR_W = 11`) read-only
+`native_ram` instance holding the program a loader copies into SDRAM.
+Both CPU ports reach it (the fetch side runs the boot code, the load side
+reads the payload) and the macro has one port, so the two are arbitrated
+with the D port winning ties — the same fixed priority the miss FSM uses;
+the loser retries the next cycle. A store to the ROM region retires as a
+posted no-op. `cache_cntrl`'s `BOOTROM_FILE` parameter (forwarded from
+`fpga_top`) is its `$readmemh` image; `sim/bootrom.hex` is the
+simulation one, word *i* = `{32'hB0070000+i, 32'hC0DE0000+i}`.
+
+The control register is `CSR_W` = 8 bits, byte 0 of the addressed
+doubleword. Bit `CSR_BIT_BYPASS` (0) is CACHE_BYPASS: while it is set,
+SDRAM loads and stores skip the cache arrays entirely and the miss FSM
+moves the doubleword straight to/from the device (`S_BP_*` states, two
+32-bit words; a store word that is not fully strobed is read-modify-
+written, because the controller drives `dqm` itself and the pins cannot
+mask it). The rest of the register is readable/writable scratch. Only the
+D port may write it — the I port is read-only by spec, so a store there
+is dropped — and both ports may read it. `CSR_RST_VAL` (default 0) is its
+power-on value.
+
+Bypass is NOT a coherence mechanism: a line cached before the bit was set
+stays cached and stale. It exists for the boot sequence, where a loader
+must get a program into the DEVICE (not into a dirty D-cache line the
+fetch side will never see) before jumping to it.
+
+Requests are steered by a target decoded from the address AT ACCEPT and
+frozen for the slot's lifetime (`slot_tgt_q`), so flipping CACHE_BYPASS
+cannot re-route a request already in flight. Every non-cached target
+(bootrom, register, bypass) is accepted only into an IDLE port and blocks
+that port until it retires, which is what lets those paths ignore the
+response queue's ordering machinery: while one is in flight there is
+nothing else in flight to order it against. The cost is the I port's
+second outstanding read for the duration of a bootrom fetch.
 
 ## Current state / known TODOs
 
@@ -394,9 +454,13 @@ completion signals. Remaining open items, marked `TODO` in source:
   not a measured optimum.
 - The board build has never been run: synthesis, PnR and timing closure at
   50 MHz are the open Phase-6 items (TODO.md).
-- The bootrom has no CPU-side fetch mux yet, so `bootr_req` is tied to `'0`
-  (an undriven net is a Gowin EX1998 warning) and `bootr_rsp` is unread —
-  synthesis prunes the macro until the mux drives it.
+- No boot image exists yet: `BOOTROM_FILE` defaults to `""` on the board
+  build, and an uninitialised read-only array is a constant that
+  GowinSynthesis may build as one (see `native_ram`'s `ram_style`
+  comment). The macro itself is wired to both CPU ports.
+- `cache_bist` does not exercise the bootrom, the control register or the
+  bypass path — those are covered in `sim_top` (phases R/X/Y/Z) only, so
+  the board self test still says nothing about them.
 
 ## Completion plan
 

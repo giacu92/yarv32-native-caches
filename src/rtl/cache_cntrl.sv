@@ -2,7 +2,7 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
-import rv32_pkg::*;
+import yarv32_cache_pkg::*;
 
 /**
  * Cache line size: 32 byte
@@ -38,7 +38,15 @@ module cache_cntrl #(
     // reset it drives NOP, which is exactly what the chip wants to see.
     // Skipping this is invisible in simulation but leaves a real device
     // with an unprogrammed mode register and undefined reads.
-    parameter int SDRAM_INIT_US = 200
+    parameter int SDRAM_INIT_US = 200,
+    // Optional $readmemh image for the bootrom (2 KiB, 256 x 64 bit).
+    // Empty means an uninitialised macro: legal, but it reads back
+    // whatever the device powered up with.
+    parameter string BOOTROM_FILE = "",
+    // Power-on value of the control register (see CSR_W / CSR_BIT_BYPASS
+    // in the package). Default 0: caches enabled, bypass off — the
+    // behaviour of the design before the register existed.
+    parameter logic [CSR_W-1:0] CSR_RST_VAL = '0
 ) (
     input wire clk_i,
     input wire rstn_i,
@@ -178,8 +186,8 @@ module cache_cntrl #(
     // cache line wide; tag_*_t is one tag word wide. This keeps the
     // native_ram port widths and the arrays below matched by construction
     // for any CL_SIZE / N_WAY / CACHE_SIZE parameterization.
-    `YARV_MEM_TYPES(way_req_t, way_rsp_t, MEM_WIDTH, DATA_WIDTH)
-    `YARV_MEM_TYPES(tag_req_t, tag_rsp_t, MEM_WIDTH, TAG_DATA_W)
+    `YARV_MEM_TYPES(way_req_t, way_rsp_t, yarv32_cache_pkg::MEM_WIDTH, DATA_WIDTH)
+    `YARV_MEM_TYPES(tag_req_t, tag_rsp_t, yarv32_cache_pkg::MEM_WIDTH, TAG_DATA_W)
 
 `ifdef VERILATOR
     // Elaboration-time geometry check: the tag macros must have one word
@@ -254,7 +262,8 @@ module cache_cntrl #(
     // Response queue (per cache): captured hit data, delivered to the CPU in
     // accept order. rvalid is a LEVEL held until rready pops the head —
     // protocol compliance, not a one-cycle lookup pulse.
-    logic [N_CACHE-1:0][N_SLOT-1:0][MEM_WIDTH-1:0] rq_q;  // rq_q[c][0] is the head
+    logic [N_CACHE-1:0][N_SLOT-1:0][yarv32_cache_pkg::MEM_WIDTH-1:0]
+        rq_q;  // rq_q[c][0] is the head
     logic [N_CACHE-1:0][N_SLOT-1:0] rq_blk_q;  // entry waits behind an older miss
     logic [N_CACHE-1:0][1:0] rq_cnt_q;  // entries in the queue (0..2)
 
@@ -286,6 +295,49 @@ module cache_cntrl #(
     logic [N_CACHE-1:0] slot_miss_wait;  // a slot awaits FSM pickup
     logic [N_CACHE-1:0][2:0] slot_outstanding;  // occupied slots + queue entries
 
+    // -------------------------------------------------------------
+    // Request target, decoded from the address at ACCEPT and latched per
+    // slot. Decoding once, at accept, is what makes the control register
+    // safe to write: a request already in flight keeps the target it was
+    // accepted with, so flipping CACHE_BYPASS cannot re-route it halfway.
+    //
+    //   TGT_CACHE : SDRAM through the cache (tag lookup, refill, the lot)
+    //   TGT_MEM   : SDRAM, cache bypassed — the miss FSM moves the
+    //               doubleword straight to/from the device
+    //   TGT_BOOT  : bootrom read (a write is a posted no-op: it is a ROM)
+    //   TGT_CSR   : control register read/write
+    // -------------------------------------------------------------
+    localparam logic [1:0] TGT_CACHE = 2'd0;
+    localparam logic [1:0] TGT_MEM = 2'd1;
+    localparam logic [1:0] TGT_BOOT = 2'd2;
+    localparam logic [1:0] TGT_CSR = 2'd3;
+
+    logic [N_CACHE-1:0][N_SLOT-1:0][1:0] slot_tgt_q;  // target of each occupied slot
+    logic [N_CACHE-1:0][1:0] acc_tgt;  // target of the request being offered now
+
+    // The uncached targets share one rule: a slot holding one is the only
+    // thing outstanding on its port (see the wready gating), so ordering
+    // against cached responses needs no extra machinery — there is nothing
+    // to order against.
+    logic [N_CACHE-1:0] nc_busy;  // this port holds an uncached slot
+    logic [N_CACHE-1:0][SLOT_IDX_W-1:0] nc_sel;  // which slot that is
+    logic [N_CACHE-1:0][1:0] nc_tgt;  // its target
+    logic [N_CACHE-1:0] nc_start;  // it has not been serviced yet
+    logic [N_CACHE-1:0] nc_free;  // it completes this cycle: free the slot
+    logic [N_CACHE-1:0] nc_push;  // ... and pushes a response
+    logic [N_CACHE-1:0][yarv32_cache_pkg::MEM_WIDTH-1:0] nc_push_data;
+    logic [N_CACHE-1:0] nc_boot_go;  // bootrom read granted this cycle
+    logic [N_CACHE-1:0] nc_byp_go;  // bypass slot handed to the miss FSM
+
+    // Bootrom arbitration state: which port owns the read in flight.
+    logic boot_busy_q;
+    logic boot_owner_q;
+
+    // Control register (CSR_W bits, see the package for the bit map).
+    logic [CSR_W-1:0] csr_q;
+    logic csr_wr;
+    wire cache_bypass = csr_q[CSR_BIT_BYPASS];
+
     // Victim state for a missed slot, captured at its lookup pulse (the only
     // cycle the tag answers are guaranteed current — a later lookup on the
     // tag macro overwrites rdata_q). Round-robin victim selection per set:
@@ -309,7 +361,7 @@ module cache_cntrl #(
     logic [N_CACHE-1:0] fsm_unstall;  // completed miss frees its slot (one cycle)
     logic [$clog2(N_SLOT)-1:0] fsm_unstall_slot;  // slot being unstalled
     logic [N_CACHE-1:0] fsm_rsp_push;  // completed miss was a load: push its response
-    logic [MEM_WIDTH-1:0] fsm_rsp_data;  // response data from the refilled line
+    logic [yarv32_cache_pkg::MEM_WIDTH-1:0] fsm_rsp_data;  // response data from the refilled line
     logic [NBIT_WAY-1:0] fsm_victim_way;  // victim way the FSM operates on
     way_req_t fsm_way_req;  // FSM request to the data macros
     tag_req_t fsm_tag_req;  // FSM request to the tag macros
@@ -363,6 +415,116 @@ module cache_cntrl #(
         end
     end
 
+    // ===================================================================
+    // Uncached targets: decode, bootrom arbitration, control register
+    // ===================================================================
+
+    function automatic logic [1:0] req_target(input logic [yarv32_cache_pkg::MEM_WIDTH-1:0] a,
+                                              input logic byp);
+        case (yarv_region(
+            a
+        ))
+            RGN_BOOT: req_target = TGT_BOOT;
+            RGN_CSR:  req_target = TGT_CSR;
+            default:  req_target = byp ? TGT_MEM : TGT_CACHE;
+        endcase
+    endfunction
+
+    assign acc_tgt[0] = req_target(icache_req_i.addr, cache_bypass);
+    assign acc_tgt[1] = req_target(dcache_req_i.addr, cache_bypass);
+
+    // The uncached slot of each port (at most one, by the wready gating).
+    always_comb begin
+        for (int c = 0; c < N_CACHE; c++) begin
+            nc_busy[c] = 1'b0;
+            nc_sel[c]  = '0;
+            for (int sl = N_SLOT - 1; sl >= 0; sl--) begin
+                if (skid_valid_q[c][sl] && (slot_tgt_q[c][sl] != TGT_CACHE)) begin
+                    nc_busy[c] = 1'b1;
+                    nc_sel[c]  = SLOT_IDX_W'(sl);
+                end
+            end
+            nc_tgt[c]   = slot_tgt_q[c][nc_sel[c]];
+            // Not serviced yet. slot_lookup_q is reused as "started": the
+            // bootrom read has been launched, or the bypass has been handed
+            // to the miss FSM. Single-cycle targets (the register, a write
+            // to the ROM) free the slot instead and never set it.
+            nc_start[c] = nc_busy[c] && !slot_lookup_q[c][nc_sel[c]];
+        end
+    end
+
+    // Control register: one cycle, no memory behind it. Only the D port
+    // may write (the I port is read-only by spec, so a store there is a
+    // posted no-op); both may read.
+    logic [N_CACHE-1:0] nc_csr_done;
+    assign nc_csr_done[0] = nc_start[0] && (nc_tgt[0] == TGT_CSR);
+    assign nc_csr_done[1] = nc_start[1] && (nc_tgt[1] == TGT_CSR);
+    assign csr_wr = nc_csr_done[1] && skid_q[1][nc_sel[1]].we && skid_q[1][nc_sel[1]].wstrb[0];
+
+    // Bootrom: read-only, so a store to it retires with no side effect.
+    logic [N_CACHE-1:0] nc_boot_wr;
+    assign nc_boot_wr[0] = nc_start[0] && (nc_tgt[0] == TGT_BOOT) && skid_q[0][nc_sel[0]].we;
+    assign nc_boot_wr[1] = nc_start[1] && (nc_tgt[1] == TGT_BOOT) && skid_q[1][nc_sel[1]].we;
+
+    // Bootrom read: one macro, two ports. D wins ties, the same fixed
+    // priority the miss FSM uses; the loser simply retries next cycle
+    // (nc_start stays asserted until its own grant).
+    logic [N_CACHE-1:0] boot_rd_req;
+    assign boot_rd_req[0] = nc_start[0] && (nc_tgt[0] == TGT_BOOT) && !skid_q[0][nc_sel[0]].we;
+    assign boot_rd_req[1] = nc_start[1] && (nc_tgt[1] == TGT_BOOT) && !skid_q[1][nc_sel[1]].we;
+
+    assign nc_boot_go[1]  = boot_rd_req[1] && !boot_busy_q && bootr_rsp.wready;
+    assign nc_boot_go[0]  = boot_rd_req[0] && !boot_busy_q && bootr_rsp.wready && !nc_boot_go[1];
+
+    always_comb begin
+        bootr_req        = '0;
+        bootr_req.valid  = |nc_boot_go;
+        bootr_req.we     = 1'b0;
+        bootr_req.addr   = nc_boot_go[1] ? skid_q[1][nc_sel[1]].addr : skid_q[0][nc_sel[0]].addr;
+        bootr_req.rready = 1'b1;
+    end
+
+    // The macro answers one cycle after the launch and holds rvalid until
+    // rready, which is tied high here — so this is the completion cycle.
+    wire boot_done = boot_busy_q && bootr_rsp.rvalid;
+    logic [N_CACHE-1:0] boot_done_c;
+    assign boot_done_c[0] = boot_done && (boot_owner_q == 1'b0);
+    assign boot_done_c[1] = boot_done && (boot_owner_q == 1'b1);
+
+    // Cache bypass: hand the slot to the miss FSM, which moves the
+    // doubleword to/from the SDRAM without touching the cache arrays.
+    // miss_seen_q is the same hand-off a real miss uses.
+    assign nc_byp_go[0]   = nc_start[0] && (nc_tgt[0] == TGT_MEM);
+    assign nc_byp_go[1]   = nc_start[1] && (nc_tgt[1] == TGT_MEM);
+
+    // Completion: which uncached slots retire this cycle, and which of
+    // them owe the CPU a response. The bypass path does NOT appear here —
+    // it retires through the FSM's unstall, like a miss.
+    always_comb begin
+        for (int c = 0; c < N_CACHE; c++) begin
+            nc_free[c] = nc_csr_done[c] || nc_boot_wr[c] || boot_done_c[c];
+            nc_push[c] = boot_done_c[c] || (nc_csr_done[c] && !skid_q[c][nc_sel[c]].we);
+            nc_push_data[c] = boot_done_c[c] ?
+                bootr_rsp.rdata : {{(yarv32_cache_pkg::MEM_WIDTH - CSR_W) {1'b0}}, csr_q};
+        end
+    end
+
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) begin
+            csr_q        <= CSR_RST_VAL;
+            boot_busy_q  <= 1'b0;
+            boot_owner_q <= 1'b0;
+        end else begin
+            if (csr_wr) csr_q <= skid_q[1][nc_sel[1]].wdata[CSR_W-1:0];
+            if (|nc_boot_go) begin
+                boot_busy_q  <= 1'b1;
+                boot_owner_q <= nc_boot_go[1];
+            end else if (boot_done) begin
+                boot_busy_q <= 1'b0;
+            end
+        end
+    end
+
     // The address split runs off the skid slot being launched (see skid_q).
     mem_req_t [N_CACHE-1:0] cache_req;
 
@@ -382,8 +544,14 @@ module cache_cntrl #(
             // race the line/tag commit. Lookups on the OTHER cache and
             // accepts/wready are unaffected — hits-under-miss resume during
             // the (long) refill states, which do not touch the macros.
-            cache_lookup_go[c] = ((skid_valid_q[c][0] && !slot_lookup_q[c][0]) ||
-                                  (skid_valid_q[c][1] && !slot_lookup_q[c][1])) &&
+            //
+            // Only TGT_CACHE slots take this path: an uncached slot is
+            // serviced by the bootrom/register/bypass logic instead, and a
+            // tag lookup for it would be a lookup of an address that has no
+            // tag (0x80_0000 aliases onto set 0 of the cache).
+            cache_lookup_go[c] =
+                ((skid_valid_q[c][0] && !slot_lookup_q[c][0] && (slot_tgt_q[c][0] == TGT_CACHE)) ||
+                 (skid_valid_q[c][1] && !slot_lookup_q[c][1] && (slot_tgt_q[c][1] == TGT_CACHE))) &&
                 !fsm_lookup_gate[c];
         end
     end
@@ -423,21 +591,18 @@ module cache_cntrl #(
     // Module declarations
     // ===================================================================
 
-    // Bootrom 2 KiB.
+    // Bootrom, 2 KiB read-only, mapped at BOOTROM_BASE (0x80_0000).
     //
-    // TODO: no CPU-side fetch mux exists yet, so nothing issues bootrom
-    // requests. The port is tied off explicitly rather than left floating
-    // — an undriven net is a Gowin EX1998 warning and an X source in a
-    // non-2-state simulator. With a constant-0 request the macro has no
-    // observable output, so synthesis prunes it; it comes back the moment
-    // the fetch mux drives bootr_req.
-    assign bootr_req = '0;
-
+    // Both CPU ports reach it: the fetch side runs boot code out of it,
+    // and the load side reads the payload the boot code copies into
+    // SDRAM. The macro has one port, so the two are arbitrated (D wins
+    // ties, same rule as the miss FSM) in the uncached-request section
+    // below, which drives bootr_req and consumes bootr_rsp.
     native_ram #(
-        .ADDR_W    (11),         // 2 KiB
-        .DATA_WIDTH(MEM_WIDTH),
+        .ADDR_W    (BOOTROM_ADDR_W),               // 2 KiB
+        .DATA_WIDTH(yarv32_cache_pkg::MEM_WIDTH),
         .READ_ONLY (1),
-        .INIT_FILE ("")
+        .INIT_FILE (BOOTROM_FILE)
     ) u_bootrom (
         .clk_i    (clk_i),
         .rstn_i   (rstn_i),
@@ -627,7 +792,9 @@ module cache_cntrl #(
             // BYTES_W bits of addr as byte-select, not as part of the set
             // index (see TAG_BYTES_W comment above).
             itag_req[i].addr = {
-                {(MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}}, set_idx[0], {TAG_BYTES_W{1'b0}}
+                {(yarv32_cache_pkg::MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}},
+                set_idx[0],
+                {TAG_BYTES_W{1'b0}}
             };
             itag_req[i].rready = 1'b1;
 
@@ -635,7 +802,9 @@ module cache_cntrl #(
             dtag_req[i].valid = cache_lookup_go[1];
             dtag_req[i].we = 1'b0;
             dtag_req[i].addr = {
-                {(MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}}, set_idx[1], {TAG_BYTES_W{1'b0}}
+                {(yarv32_cache_pkg::MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}},
+                set_idx[1],
+                {TAG_BYTES_W{1'b0}}
             };
             dtag_req[i].rready = 1'b1;
         end
@@ -649,7 +818,7 @@ module cache_cntrl #(
                 itag_req[i].valid = 1'b1;
                 itag_req[i].we = 1'b1;
                 itag_req[i].addr = {
-                    {(MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}},
+                    {(yarv32_cache_pkg::MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}},
                     tag_init_set,
                     {TAG_BYTES_W{1'b0}}
                 };
@@ -752,7 +921,7 @@ module cache_cntrl #(
 
     // 64-bit doubleword selected out of the hit line (cmp_dw_sel_q is the
     // launch-registered copy of addr[NBIT_OFFSET-1:3]).
-    logic [MEM_WIDTH-1:0] icache_push_data, dcache_push_data;
+    logic [yarv32_cache_pkg::MEM_WIDTH-1:0] icache_push_data, dcache_push_data;
     assign icache_push_data = icache_line[cmp_dw_sel_q[0]*64+:64];
     assign dcache_push_data = dcache_line[cmp_dw_sel_q[1]*64+:64];
 
@@ -785,14 +954,16 @@ module cache_cntrl #(
     assign cache_pop[0] = icache_req_i.rready && icache_rsp_o.rvalid;
     assign cache_pop[1] = dcache_req_i.rready && dcache_rsp_o.rvalid;
 
-    // Queue push: the tag answer was a load hit.
+    // Queue push: the tag answer was a load hit, or an uncached read
+    // (bootrom / control register) completed. The two can never coincide —
+    // an uncached slot is alone on its port — so one queue port serves both.
     logic [N_CACHE-1:0] cache_push;
-    assign cache_push[0] = cache_rsp_pulse[0] && cache_hit_pulse[0] && !cmp_we_q[0];
-    assign cache_push[1] = cache_rsp_pulse[1] && cache_hit_pulse[1] && !cmp_we_q[1];
+    assign cache_push[0] = (cache_rsp_pulse[0] && cache_hit_pulse[0] && !cmp_we_q[0]) || nc_push[0];
+    assign cache_push[1] = (cache_rsp_pulse[1] && cache_hit_pulse[1] && !cmp_we_q[1]) || nc_push[1];
 
-    logic [N_CACHE-1:0][MEM_WIDTH-1:0] cache_push_data;
-    assign cache_push_data[0] = icache_push_data;
-    assign cache_push_data[1] = dcache_push_data;
+    logic [N_CACHE-1:0][yarv32_cache_pkg::MEM_WIDTH-1:0] cache_push_data;
+    assign cache_push_data[0] = nc_push[0] ? nc_push_data[0] : icache_push_data;
+    assign cache_push_data[1] = nc_push[1] ? nc_push_data[1] : dcache_push_data;
 
     // An unresolved miss (pending pickup or owned by the FSM) older than
     // the entry being pushed blocks that entry: responses must be delivered
@@ -816,6 +987,8 @@ module cache_cntrl #(
                 miss_seen_q[c][1]    <= 1'b0;
                 slot_miss_q[c][0]    <= 1'b0;
                 slot_miss_q[c][1]    <= 1'b0;
+                slot_tgt_q[c][0]     <= TGT_CACHE;
+                slot_tgt_q[c][1]     <= TGT_CACHE;
                 rq_q[c][0]           <= '0;
                 rq_q[c][1]           <= '0;
                 rq_blk_q[c][0]       <= 1'b0;
@@ -844,7 +1017,23 @@ module cache_cntrl #(
                     slot_rsp_q[c][slot_free[c]]    <= 1'b0;
                     miss_seen_q[c][slot_free[c]]   <= 1'b0;
                     slot_miss_q[c][slot_free[c]]   <= 1'b0;
+                    // Target decoded from the address (and the bypass bit
+                    // as it stands NOW) and frozen for the slot's lifetime.
+                    slot_tgt_q[c][slot_free[c]]    <= acc_tgt[c];
                 end
+
+                // Uncached slot started: the bootrom read has been launched,
+                // or the bypass request handed to the miss FSM. Reuses
+                // slot_lookup_q as the "already started" flag, so the
+                // service logic fires exactly once per request, the same
+                // property cache_lookup_go gives a cached one.
+                if (nc_boot_go[c] || nc_byp_go[c]) slot_lookup_q[c][nc_sel[c]] <= 1'b1;
+                if (nc_byp_go[c]) miss_seen_q[c][nc_sel[c]] <= 1'b1;
+
+                // Uncached slot retired (register access, or a write to the
+                // ROM, or the bootrom read answered). The bypass path does
+                // not come through here: it retires at the FSM's unstall.
+                if (nc_free[c]) skid_valid_q[c][nc_sel[c]] <= 1'b0;
 
                 // Lookup launch for the (single) un-launched slot.
                 if (cache_lookup_go[c]) begin
@@ -967,7 +1156,16 @@ module cache_cntrl #(
         S_REFILL_ISSUE,  // refill word read handshake
         S_REFILL_WAIT,  // wait for rd_ready, capture the word
         S_UPDATE_TAG,  // commit line + tag into the victim way
-        S_UNSTALL  // free the missed slot, deliver the response
+        S_UNSTALL,  // free the missed slot, deliver the response
+        // Cache-bypass path (TGT_MEM): one CPU doubleword straight
+        // to/from the device, two 32-bit SDRAM words, no cache array
+        // touched. A store is a read-modify-write per word unless the
+        // store strobes all four of its bytes — the controller drives dqm
+        // itself, so a partial word cannot be masked at the pins.
+        S_BP_RD_ISSUE,
+        S_BP_RD_WAIT,
+        S_BP_WR_ISSUE,
+        S_BP_WR_WAIT
     } fsm_state_e;
 
     fsm_state_e state_q, state_d;
@@ -1035,8 +1233,9 @@ module cache_cntrl #(
     logic req_sel_q, req_sel_d;  // 0 = icache, 1 = dcache
     logic [3:0] burst_cnt_q, burst_cnt_d;  // 0 .. BURST_LEN-1
     logic [DATA_WIDTH-1:0] line_buf_q, line_buf_d;  // staged/assembled cache line
-    logic [MEM_WIDTH-1:0] miss_addr_q, miss_addr_d;
+    logic [yarv32_cache_pkg::MEM_WIDTH-1:0] miss_addr_q, miss_addr_d;
     logic [$clog2(N_SLOT)-1:0] miss_slot_q, miss_slot_d;  // skid slot the FSM owns
+    logic byp_q, byp_d;  // the latched slot is a cache-bypass access
 
     logic miss_pending;
     logic miss_sel;  // 0 = icache, 1 = dcache (the entry the FSM will pick up)
@@ -1065,6 +1264,7 @@ module cache_cntrl #(
             line_buf_q  <= '0;
             miss_addr_q <= '0;
             miss_slot_q <= '0;
+            byp_q       <= 1'b0;
         end else begin
             state_q     <= state_d;
             req_sel_q   <= req_sel_d;
@@ -1072,6 +1272,7 @@ module cache_cntrl #(
             line_buf_q  <= line_buf_d;
             miss_addr_q <= miss_addr_d;
             miss_slot_q <= miss_slot_d;
+            byp_q       <= byp_d;
         end
     end
 
@@ -1089,20 +1290,54 @@ module cache_cntrl #(
     };
     assign refill_byte_addr = {miss_addr_q[MEM_SIZE-1:NBIT_OFFSET], {NBIT_OFFSET{1'b0}}};
 
+    // Cache-bypass datapath. A CPU access is 64 bit and the SDRAM bus is
+    // 32, so a bypass moves BP_WORDS words; burst_cnt_q[0] selects which,
+    // and the word address is the doubleword base plus that bit.
+    localparam int BP_WORDS = yarv32_cache_pkg::MEM_WIDTH / 32;
+
+    wire bp_hi = burst_cnt_q[0];  // 1 = upper 32 bits of the doubleword
+    wire bp_last = ({28'd0, burst_cnt_q} == BP_WORDS - 1);
+    wire [MEM_SIZE-1:2] bp_word_addr = {miss_addr_q[MEM_SIZE-1:3], bp_hi};
+
+    wire [3:0] bp_strb = bp_hi ? skid_q[req_sel_q][miss_slot_q].wstrb[7:4] :
+        skid_q[req_sel_q][miss_slot_q].wstrb[3:0];
+    wire [31:0] bp_wdata = bp_hi ? skid_q[req_sel_q][miss_slot_q].wdata[63:32] :
+        skid_q[req_sel_q][miss_slot_q].wdata[31:0];
+
+    // A store that strobes the whole word needs no read first; a partial
+    // one is merged into the word just read back (the controller's dqm is
+    // not under this FSM's control, so masking at the pins is not an
+    // option).
+    wire bp_full_word = &bp_strb;
+    wire bp_skip_read = miss_is_store && bp_full_word;
+
+    logic [31:0] bp_wr_data;
+
+    always_comb begin
+        bp_wr_data = bp_hi ? line_buf_q[63:32] : line_buf_q[31:0];
+        for (int b = 0; b < 4; b++) begin
+            if (bp_strb[b]) bp_wr_data[b*8+:8] = bp_wdata[b*8+:8];
+        end
+    end
+
     always_comb begin
         // defaults: hold state / datapath
-        state_d       = state_q;
-        req_sel_d     = req_sel_q;
-        burst_cnt_d   = burst_cnt_q;
-        line_buf_d    = line_buf_q;
-        miss_addr_d   = miss_addr_q;
-        miss_slot_d   = miss_slot_q;
+        state_d = state_q;
+        req_sel_d = req_sel_q;
+        burst_cnt_d = burst_cnt_q;
+        line_buf_d = line_buf_q;
+        miss_addr_d = miss_addr_q;
+        miss_slot_d = miss_slot_q;
+        byp_d = byp_q;
 
-        sdram_rd_en   = 1'b0;
-        sdram_wr_en   = 1'b0;
-        sdram_wr_addr = wb_byte_addr[MEM_SIZE-1:2] + {17'd0, burst_cnt_q};
-        sdram_wr_data = fsm_victim_line[burst_cnt_q*32+:32];
-        sdram_rd_addr = refill_byte_addr[MEM_SIZE-1:2] + {17'd0, burst_cnt_q};
+        sdram_rd_en = 1'b0;
+        sdram_wr_en = 1'b0;
+        // Line traffic (writeback / refill) walks the line word by word;
+        // a bypass addresses the CPU doubleword directly.
+        sdram_wr_addr = byp_q ? bp_word_addr : (wb_byte_addr[MEM_SIZE-1:2] + {17'd0, burst_cnt_q});
+        sdram_wr_data = byp_q ? bp_wr_data : fsm_victim_line[burst_cnt_q*32+:32];
+        sdram_rd_addr = byp_q ?
+            bp_word_addr : (refill_byte_addr[MEM_SIZE-1:2] + {17'd0, burst_cnt_q});
 
         unique case (state_q)
 
@@ -1116,6 +1351,10 @@ module cache_cntrl #(
                     req_sel_d   = miss_sel;
                     miss_addr_d = skid_q[miss_sel][slot_miss_sel[miss_sel]].addr;
                     miss_slot_d = $clog2(N_SLOT)'(slot_miss_sel[miss_sel]);
+                    // A bypass slot arrives through the same hand-off as a
+                    // miss (miss_seen_q); this is what tells the two apart
+                    // for the rest of the transfer.
+                    byp_d       = (slot_tgt_q[miss_sel][slot_miss_sel[miss_sel]] == TGT_MEM);
                     state_d     = S_ARBITRATE;
                 end
             end
@@ -1126,8 +1365,13 @@ module cache_cntrl #(
                 // valid AND dirty victim needs its line written back before
                 // the refill overwrites the way.
                 burst_cnt_d = '0;
-                state_d = (victim_valid_q[req_sel_q][miss_slot_q] &&
-                           victim_dirty_q[req_sel_q][miss_slot_q]) ? S_WB_READ : S_REFILL_ISSUE;
+                // A bypass has no victim (no tag lookup ever ran for it,
+                // so victim_*_q hold whatever the previous miss left) and
+                // no line: straight to the two-word transfer.
+                if (byp_q) state_d = S_BP_RD_ISSUE;
+                else
+                    state_d = (victim_valid_q[req_sel_q][miss_slot_q] &&
+                               victim_dirty_q[req_sel_q][miss_slot_q]) ? S_WB_READ : S_REFILL_ISSUE;
             end
 
             S_WB_READ: begin
@@ -1203,6 +1447,52 @@ module cache_cntrl #(
                 state_d = S_IDLE;
             end
 
+            // ---- cache-bypass transfer (byp_q), one word at a time ----
+
+            S_BP_RD_ISSUE: begin
+                // A full-word store overwrites everything the read would
+                // have returned, so skip it.
+                if (bp_skip_read) begin
+                    state_d = S_BP_WR_ISSUE;
+                end else begin
+                    sdram_rd_en = !sdram_busy;
+                    if (sdram_busy) state_d = S_BP_RD_WAIT;
+                end
+            end
+
+            S_BP_RD_WAIT: begin
+                if (sdram_rd_ready) begin
+                    if (bp_hi) line_buf_d[63:32] = sdram_rd_data;
+                    else line_buf_d[31:0] = sdram_rd_data;
+                    if (miss_is_store) begin
+                        state_d = S_BP_WR_ISSUE;
+                    end else if (bp_last) begin
+                        state_d = S_UNSTALL;
+                    end else begin
+                        burst_cnt_d = burst_cnt_q + 1'b1;
+                        state_d     = S_BP_RD_ISSUE;
+                    end
+                end
+            end
+
+            S_BP_WR_ISSUE: begin
+                // Hold the enable until the controller accepts, same rule
+                // as the writeback path.
+                sdram_wr_en = !sdram_busy;
+                if (sdram_busy) state_d = S_BP_WR_WAIT;
+            end
+
+            S_BP_WR_WAIT: begin
+                if (!sdram_busy) begin
+                    if (bp_last) begin
+                        state_d = S_UNSTALL;
+                    end else begin
+                        burst_cnt_d = burst_cnt_q + 1'b1;
+                        state_d     = S_BP_RD_ISSUE;
+                    end
+                end
+            end
+
             default: state_d = S_IDLE;
         endcase
     end
@@ -1225,7 +1515,7 @@ module cache_cntrl #(
     always_comb begin
         commit_line = line_buf_q;
         if (miss_is_store) begin
-            for (int b = 0; b < MEM_WIDTH / 8; b++) begin
+            for (int b = 0; b < yarv32_cache_pkg::MEM_WIDTH / 8; b++) begin
                 if (skid_q[req_sel_q][miss_slot_q].wstrb[b]) begin
                     commit_line[miss_addr_q[NBIT_OFFSET-1:3]*64+b*8+:8] =
                         skid_q[req_sel_q][miss_slot_q].wdata[b*8+:8];
@@ -1256,7 +1546,7 @@ module cache_cntrl #(
                 fsm_way_req.valid = 1'b1;
                 fsm_way_req.we = 1'b0;
                 fsm_way_req.addr = {
-                    {(MEM_WIDTH - MEM_SIZE) {1'b0}},
+                    {(yarv32_cache_pkg::MEM_WIDTH - MEM_SIZE) {1'b0}},
                     victim_tag_q[req_sel_q][miss_slot_q],
                     miss_addr_q[NBIT_OFFSET+:NBIT_SET_IDX],
                     {NBIT_OFFSET{1'b0}}
@@ -1282,7 +1572,9 @@ module cache_cntrl #(
                 // Line commit at the missing address itself (zero-extended);
                 // the macro decodes word_addr = addr[11:5] = set, exactly as
                 // the CPU lookups do.
-                fsm_way_req.addr = {{(MEM_WIDTH - MEM_SIZE) {1'b0}}, miss_addr_q[MEM_SIZE-1:0]};
+                fsm_way_req.addr = {
+                    {(yarv32_cache_pkg::MEM_WIDTH - MEM_SIZE) {1'b0}}, miss_addr_q[MEM_SIZE-1:0]
+                };
                 fsm_way_req.wdata = commit_line;
                 fsm_way_req.wstrb = {(DATA_WIDTH / 8) {1'b1}};
                 fsm_way_req.rready = 1'b1;
@@ -1291,7 +1583,7 @@ module cache_cntrl #(
                 fsm_tag_req.we = 1'b1;
                 // Same set-index shift as the lookup requests.
                 fsm_tag_req.addr = {
-                    {(MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}},
+                    {(yarv32_cache_pkg::MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}},
                     miss_addr_q[NBIT_OFFSET+:NBIT_SET_IDX],
                     {TAG_BYTES_W{1'b0}}
                 };
@@ -1327,7 +1619,11 @@ module cache_cntrl #(
     assign fsm_unstall[1] = (state_q == S_UNSTALL) && (req_sel_q == 1'b1);
     assign fsm_rsp_push[0] = fsm_unstall[0] && !skid_q[0][miss_slot_q].we;
     assign fsm_rsp_push[1] = fsm_unstall[1] && !skid_q[1][miss_slot_q].we;
-    assign fsm_rsp_data = line_buf_q[miss_addr_q[NBIT_OFFSET-1:3]*64+:64];
+    // A refill answers out of the line it just assembled; a bypass answers
+    // with the two words it fetched, which sit at the bottom of the same
+    // buffer.
+    assign fsm_rsp_data = byp_q ? line_buf_q[yarv32_cache_pkg::MEM_WIDTH-1:0] :
+        line_buf_q[miss_addr_q[NBIT_OFFSET-1:3]*64+:64];
 
     // -------------------------------------------------------------
     // D-cache store hit (posted). The data-macro write into the hit way and
@@ -1361,7 +1657,7 @@ module cache_cntrl #(
         // Start from the line as it stands in the hit way, then overwrite
         // only the strobed bytes of the addressed doubleword.
         dstore_way_req.wdata = dcache_line;
-        for (int b = 0; b < MEM_WIDTH / 8; b++) begin
+        for (int b = 0; b < yarv32_cache_pkg::MEM_WIDTH / 8; b++) begin
             if (skid_q[1][slot_rsp_sel[1]].wstrb[b]) begin
                 dstore_way_req.wdata[cmp_dw_sel_q[1]*64+b*8+:8] =
                     skid_q[1][slot_rsp_sel[1]].wdata[b*8+:8];
@@ -1374,7 +1670,7 @@ module cache_cntrl #(
         dstore_tag_req.valid = dcache_store_hit;
         dstore_tag_req.we = 1'b1;
         dstore_tag_req.addr = {
-            {(MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}},
+            {(yarv32_cache_pkg::MEM_WIDTH - NBIT_SET_IDX - TAG_BYTES_W) {1'b0}},
             skid_q[1][slot_rsp_sel[1]].addr[NBIT_OFFSET+:NBIT_SET_IDX],
             {TAG_BYTES_W{1'b0}}
         };
@@ -1399,23 +1695,33 @@ module cache_cntrl #(
     //   served while the miss FSM is mid-transit; only unresolved-miss
     //   slots gate delivery.
     // -------------------------------------------------------------
-    assign icache_rsp_o.wready = tag_init_done && (slot_outstanding[0] < 3'(SKID_DEPTH[0]));
+    //   An UNCACHED request (bootrom, control register, cache bypass) is
+    //   accepted only into an idle port, and blocks the port until it
+    //   retires. That is what lets the uncached paths ignore the ordering
+    //   machinery entirely: while one is in flight there is nothing else
+    //   in flight to order it against. It costs the I-port its second
+    //   outstanding read for the duration of a bootrom fetch — boot code
+    //   runs one fetch at a time, which is the right trade for not
+    //   duplicating the queue's blocking logic per target.
+    assign icache_rsp_o.wready = tag_init_done && (slot_outstanding[0] < 3'(SKID_DEPTH[0])) &&
+        !nc_busy[0] && !((acc_tgt[0] != TGT_CACHE) && (slot_outstanding[0] != 3'd0));
     assign icache_rsp_o.rvalid = (rq_cnt_q[0] != 2'd0) && !rq_blk_q[0][0];
-    assign icache_rsp_o.rdata  = rq_q[0][0];
+    assign icache_rsp_o.rdata = rq_q[0][0];
     assign icache_rsp_o.bvalid = 1'b0;  // posted stores, no B channel
 
-    assign dcache_rsp_o.wready = tag_init_done && (slot_outstanding[1] < 3'(SKID_DEPTH[1]));
+    assign dcache_rsp_o.wready = tag_init_done && (slot_outstanding[1] < 3'(SKID_DEPTH[1])) &&
+        !nc_busy[1] && !((acc_tgt[1] != TGT_CACHE) && (slot_outstanding[1] != 3'd0));
     assign dcache_rsp_o.rvalid = (rq_cnt_q[1] != 2'd0) && !rq_blk_q[1][0];
-    assign dcache_rsp_o.rdata  = rq_q[1][0];
+    assign dcache_rsp_o.rdata = rq_q[1][0];
     assign dcache_rsp_o.bvalid = 1'b0;  // posted stores, no B channel
 
 `ifdef VERILATOR
-    logic                  icache_req_valid;
-    logic                  icache_req_we;
-    logic [ MEM_WIDTH-1:0] icache_req_addr;
-    logic [ MEM_WIDTH-1:0] icache_req_wdata;
-    logic [STRB_WIDTH-1:0] icache_req_wstrb;
-    logic                  icache_req_rready;
+    logic                                   icache_req_valid;
+    logic                                   icache_req_we;
+    logic [yarv32_cache_pkg::MEM_WIDTH-1:0] icache_req_addr;
+    logic [yarv32_cache_pkg::MEM_WIDTH-1:0] icache_req_wdata;
+    logic [                 STRB_WIDTH-1:0] icache_req_wstrb;
+    logic                                   icache_req_rready;
     assign icache_req_valid  = icache_req_i.valid;
     assign icache_req_we     = icache_req_i.we;
     assign icache_req_addr   = icache_req_i.addr;
@@ -1423,12 +1729,12 @@ module cache_cntrl #(
     assign icache_req_wstrb  = icache_req_i.wstrb;
     assign icache_req_rready = icache_req_i.rready;
 
-    logic                    itag0_req_valid;
-    logic                    itag0_req_we;
-    logic [   MEM_WIDTH-1:0] itag0_req_addr;
-    logic [  TAG_DATA_W-1:0] itag0_req_wdata;
-    logic [TAG_DATA_W/8-1:0] itag0_req_wstrb;
-    logic                    itag0_req_rready;
+    logic                                   itag0_req_valid;
+    logic                                   itag0_req_we;
+    logic [yarv32_cache_pkg::MEM_WIDTH-1:0] itag0_req_addr;
+    logic [                 TAG_DATA_W-1:0] itag0_req_wdata;
+    logic [               TAG_DATA_W/8-1:0] itag0_req_wstrb;
+    logic                                   itag0_req_rready;
     assign itag0_req_valid  = itag_req[0].valid;
     assign itag0_req_we     = itag_req[0].we;
     assign itag0_req_addr   = itag_req[0].addr;

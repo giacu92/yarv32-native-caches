@@ -66,7 +66,7 @@ mkdir -p "$OUT"
 # UART_BAUD / UART_PERIOD_W the way it does in RTL. The defines below bake
 # the fast simulation values in before synthesis, and the testbench copy
 # drops the override — same stimulus, same checks, no parameter ports.
-sv2v -DVERILATOR -DGATESIM --write="$OUT/design.v" "${SOURCES[@]}"
+sv2v -DVERILATOR -DGATESIM -DNO_SIM_PLUSARGS --write="$OUT/design.v" "${SOURCES[@]}"
 
 python3 - "$ROOT/sim/bist_tb.sv" "$OUT/gate_tb.sv" <<'PYEOF'
 import re, sys

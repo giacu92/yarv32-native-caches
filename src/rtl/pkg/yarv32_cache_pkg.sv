@@ -56,6 +56,50 @@ package yarv32_cache_pkg;
     // Native protocol, cache-line width: cache data macros.
     `YARV_MEM_TYPES(cache_req_t, cache_rsp_t, MEM_WIDTH, CACHE_WIDTH)
 
+    // ------------------------------------------------------------------
+    // System address map (24 bit). The SDRAM needs 23 bits for its 8 MiB,
+    // so bit 23 is free and separates memory from everything else:
+    //
+    //   0x00_0000 - 0x7F_FFFF  SDRAM, 8 MiB, cacheable (or bypassed)
+    //   0x80_0000 - 0x80_07FF  bootrom, 2 KiB, read-only
+    //   0x80_1000              control register, 8 bit, read/write
+    //
+    // Only bits [23] and [12] are decoded, so the bootrom aliases through
+    // 0x80_0000-0x80_0FFF and the register through 0x80_1000-0x80_1FFF.
+    // Address bits above 23 are ignored.
+    // ------------------------------------------------------------------
+    localparam int unsigned SYS_ADDR_W = 24;
+    localparam int unsigned SYS_MEM_BIT = 23;  // 0 = SDRAM, 1 = peripherals
+    localparam int unsigned SYS_CSR_BIT = 12;  // within peripherals: 0 = rom, 1 = csr
+
+    localparam logic [SYS_ADDR_W-1:0] BOOTROM_BASE = 24'h80_0000;
+    localparam logic [SYS_ADDR_W-1:0] CSR_BASE = 24'h80_1000;
+
+    // Bootrom depth: 2 KiB (ADDR_W of its native_ram instance).
+    localparam int unsigned BOOTROM_ADDR_W = 11;
+
+    // Control register: 8 bits, byte 0 of the addressed doubleword.
+    //   [0] CACHE_BYPASS — SDRAM loads and stores go straight to the
+    //       device, leaving the cache arrays untouched. Set it while a
+    //       loader writes a program into SDRAM, so the program is really
+    //       in the device (and not sitting dirty in the D-cache) when the
+    //       fetch side goes looking for it. NOT a coherence mechanism:
+    //       lines cached before the bit was set stay cached and stale.
+    //   [7:1] unused, readable/writable scratch.
+    localparam int unsigned CSR_W = 8;
+    localparam int unsigned CSR_BIT_BYPASS = 0;
+
+    // Address region a request falls in.
+    localparam logic [1:0] RGN_MEM = 2'd0;
+    localparam logic [1:0] RGN_BOOT = 2'd1;
+    localparam logic [1:0] RGN_CSR = 2'd2;
+
+    function automatic logic [1:0] yarv_region(input logic [MEM_WIDTH-1:0] a);
+        if (!a[SYS_MEM_BIT]) yarv_region = RGN_MEM;
+        else if (!a[SYS_CSR_BIT]) yarv_region = RGN_BOOT;
+        else yarv_region = RGN_CSR;
+    endfunction
+
 endpackage
 
 `resetall

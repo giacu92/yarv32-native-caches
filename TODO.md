@@ -250,7 +250,8 @@ Open:
 
 - [x] First synthesis run on the Gowin host surfaced two errors, both
   fixed: `EX1998` (net `bootr_req.valid` has no driver — the bootrom port
-  is now tied off to `'0` until a fetch mux exists) and `RP0002` (136
+  was tied off to `'0`; since Phase 9 it is really driven, by the
+  uncached-request path) and `RP0002` (136
   BSRAMs against the device's 46). The BSRAM blow-up was byte write
   enables: Gowin BSRAM has none, so a byte-writable 256-bit line macro is
   built from 32 byte-wide blocks instead of 8 (4 data macros = 128, plus 2
@@ -267,8 +268,8 @@ Open:
   constrainable object, and nothing is lost — Gowin auto-derives a clock on
   the rPLL output and no fabric logic runs on it.
 - [x] Local pre-synthesis gate `make lint-yosys` (`scripts/yosys_check.sh`,
-  sv2v + yosys): fails on undriven nets (the EX1998 class — verified: it
-  fails when the bootrom tie-off is removed) and reports a BSRAM count
+  sv2v + yosys): fails on undriven nets (the EX1998 class — verified at
+  the time against the bootrom tie-off) and reports a BSRAM count
   against 46 (currently 36). Caveat, measured: yosys reports 36 either way,
   so it would NOT have caught the byte-enable blow-up — GowinSynthesis's
   memory mapping is its own.
@@ -433,6 +434,41 @@ Open:
   violation. Verified both ways: with the hold the sim passes; with
   `SDRAM_INIT_US = 1` the model reports the early commands and the run
   fails.
+
+## Phase 9 — Bootrom, control register, cache bypass — DONE (2026-09-04)
+
+24-bit system address map (`yarv32_cache_pkg`): SDRAM at
+`0x00_0000-0x7F_FFFF`, bootrom at `0x80_0000` (2 KiB, read-only),
+control register at `0x80_1000` (8 bit). See CLAUDE.md, "System address
+map", for the decode and the reasoning.
+
+- [x] Bootrom wired to BOTH CPU ports through a one-macro arbiter (D wins
+  ties, loser retries); a store to the ROM retires as a posted no-op.
+  `BOOTROM_FILE` parameter on `cache_cntrl` and `fpga_top`;
+  `sim/bootrom.hex` is the simulation image.
+- [x] 8-bit read/write control register, D-port writes only (the I port is
+  read-only by spec), both ports read. `CSR_RST_VAL` parameter.
+- [x] Bit 0 = CACHE_BYPASS: SDRAM accesses skip the cache arrays and the
+  miss FSM moves the doubleword straight to/from the device (`S_BP_RD_*` /
+  `S_BP_WR_*`, two 32-bit words; a partially strobed word is
+  read-modify-written, since the controller owns `dqm`).
+- [x] Target decoded at ACCEPT and frozen per slot, so flipping the bypass
+  bit cannot re-route a request in flight. Uncached targets are accepted
+  only into an idle port and hold it until they retire — no new ordering
+  machinery in the response queue.
+- [x] `sim_top` phases R (bootrom, both ports, arbitration, ROM store),
+  X (register), Y (bypass load past a dirty cached line), Z (bypass
+  stores, full-word and partial, plus bypass cleared again).
+- [x] Fixed on the way: `cache_cntrl` imported a non-existent `rv32_pkg`
+  (every simulation target failed at elaboration), and `native_ram`'s
+  `+RAM_GARBAGE` block broke sv2v/yosys — now guarded by
+  `NO_SIM_PLUSARGS`, which `yosys_check.sh` and `gatesim.sh` pass.
+
+Open:
+
+- [ ] No boot image yet: `BOOTROM_FILE` is empty for the board build.
+- [ ] `cache_bist` does not exercise any of these paths, so the board self
+  test still says nothing about them.
 
 ## Phase 7 — Verification hardening
 
