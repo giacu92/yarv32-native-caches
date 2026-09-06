@@ -13,11 +13,52 @@ Tang Nano 20K
   bought ~nothing at 128 sets / 2 ways and cost a 24-bit non-power-of-2 tag
   word, tag/data index desync, and critical-path XORs.
 - **CPU access width is 64 bit.** Response word select is a doubleword
-  select, `addr[NBIT_OFFSET-1:3]`.
+  select, `addr[NBIT_OFFSET-1:3]`. — SUPERSEDED 2026-09-06 for the D port
+  (see below); still true for the I port.
 - **I-mem port: read-only, up to 2 outstanding reads** (the fetch unit
   fills a depth-8 instruction buffer of 32-bit words from the 64-bit
   rdata). The I-cache response path must track two in-flight reads; the
   D-port stays single-outstanding.
+
+## Decisions (locked 2026-09-06) — yarv32-uc interface
+
+The CPU-facing ports are now TYPE-IDENTICAL to the yarv32-uc core
+(rv32imac_zicsr_zifencei), so the two connect struct-to-struct with no
+glue. Supersedes the 64-bit-everywhere decision above:
+
+- **Two typed ports, not one shared pair.** I port:
+  `ifetch_req_t {valid, addr[31:0], rready}` / `ifetch_rsp_t {ready,
+  rvalid, rdata[63:0]}` — read-only, 2 outstanding, responses in accept
+  order, no `bvalid`. D port: `mem_req_t {wvalid, we, addr[31:0],
+  wdata[31:0], wstrb[3:0], rready}` / `mem_rsp_t {wready, rvalid,
+  rdata[31:0], bvalid}` — `bvalid` held low (posted stores, the core
+  ignores it). Field names AND order are bit-identical to the core's
+  `rv32_pkg` typedefs — struct connections are packed-vector copies, so
+  order drift silently misconnects; elaboration `$bits` asserts pin it.
+- **True 32-bit D datapath** (not a 64-bit port using half the bits):
+  D word select `addr[4:2]`, 4-byte store merge into the 256-bit line,
+  bypass moves ONE SDRAM word, D response-queue element 32 bits. I stays
+  64-bit end-to-end. Shared miss-FSM widths keyed on the owning port
+  (`req_sel_q`).
+- **The old 64-bit pair survives as `boot_req_t`/`boot_rsp_t`** — the
+  bootrom macro and `native_ram`'s parameter defaults. New constants:
+  `NATIVE_ADDR_W` (32), `IFETCH_DATA_W` (64), `LSU_DATA_W` (32),
+  `LSU_STRB_W` (4). Every address is 32-bit; the region decode looks at
+  bits [23] and [12] only, so bits above 23 are ignored by construction.
+- **The core's MMIO (addr bit 28) never reaches the cache**: the core
+  routes those to its own AXI4-Lite master. The cache need not decode
+  it — the existing bit-23 map is all it sees.
+- **I-port alignment contract**: the core issues 8-byte-aligned addresses
+  in steady state; the cache returns the aligned doubleword selected by
+  `addr[4:3]` regardless of `addr[2]`. A fetch of `addr` with `addr[2]=1`
+  gets the doubleword's low word in `rdata[31:0]` — the core picks its
+  half.
+- **External dependency (core side, not this repo)**: yarv32-uc's fetch
+  unit tracks in-flight state with a single PC register written against a
+  fixed 1-cycle slave. Against this cache's variable-latency, 2-deep
+  response stream it needs the depth-2 in-flight-PC shadow FIFO. The cache
+  guarantees in-order responses — that is all it can promise from this
+  side.
 
 ---
 
@@ -469,6 +510,49 @@ Open:
 - [ ] No boot image yet: `BOOTROM_FILE` is empty for the board build.
 - [ ] `cache_bist` does not exercise any of these paths, so the board self
   test still says nothing about them.
+
+## Phase 10 — yarv32-uc CPU interface adaptation — DONE (2026-09-06)
+
+Implements the 2026-09-06 decisions (see above). Two commits:
+`f7b22ad` (package types, additive) and `dc3498e` (the swap, atomic —
+redefining `mem_req_t` breaks every consumer at once).
+
+- [x] `yarv32_cache_pkg`: hand-declared `ifetch_req_t`/`ifetch_rsp_t` and
+  the 32-bit `mem_req_t`/`mem_rsp_t`, bit-identical to rv32_pkg
+  (`$bits` pins: 34/66, 71/35). `boot_req_t`/`boot_rsp_t` via the macro
+  at `(NATIVE_ADDR_W, IFETCH_DATA_W)`; `cache_req_t` pair at line width.
+  `yarv_region` takes a 32-bit address.
+- [x] `native_ram`: `REQ_T`/`RSP_T` defaults now the boot pair;
+  `REQ_ADDR_W` default `NATIVE_ADDR_W`.
+- [x] `cache_cntrl`: per-port skid (`iskid_q` 64-bit / `dskid_q` 32-bit`,
+  whole-struct accept copies preserved — the anti-stale-tag mechanism),
+  per-port response queues (`rq_i_q` / `rq_d_q`, shared control), I-only
+  `cmp_dw_sel_q`, new D-only `dcmp_word_sel_q` (`addr[4:2]`) and
+  `dcmp_we_q`, 32-bit `miss_addr_q`, bypass width keyed on `req_sel_q`
+  (1 SDRAM word for D, 2 for I), bootrom D reads select the half by
+  `addr[2]` at the response side, I-port write path deleted (I is
+  read-only: no `we`, no store, no bootrom-write gate), `dcache_rsp_o.bvalid`
+  tied low. Queue blocks unrolled per port, `S_UNSTALL` insertion and
+  older-miss blocking preserved.
+- [x] `cache_bist`: 32-bit stores/loads (`wstrb 4'hF`, per-index 32-bit
+  pattern), `ifetch_*` fetch stage, `dbg_hs_o` bit 1 renamed `wvalid`.
+  `BUILD_ID` bumped to 12.
+- [x] `sim_top`: `d_access` 32-bit (`addr[31:0]`, `wdata[31:0]`,
+  `wstrb[3:0]`), word-semantics phases (S/S1-S4 neighbour at +4, V1/V3
+  word expectations, V4 byte-0 store-miss merge), R1b covers the D bootrom
+  HIGH half (addr[2]=1), X/Y/Z 32-bit, `boot_lo`/`boot_hi` helpers.
+- [x] Verified: `make sim` (all phases), `make -C sim xrun`
+  (`--x-initial unique`), `+RAM_GARBAGE`, `make bist`, `make -C sim xbist`,
+  `make lint-fpga`, `make format-check` — all green.
+
+Open:
+
+- [ ] `make lint-yosys` + `make gatesim` have NOT been run against the
+  new per-port datapaths: sv2v/yosys/iverilog are not installed on this
+  machine right now (run skipped by decision 2026-09-06). The 4-state
+  gate-level check is the one that catches X-propagation through the
+  split skid/queue state — run it on the Gowin host or after installing
+  the tools before trusting a board build.
 
 ## Phase 7 — Verification hardening
 

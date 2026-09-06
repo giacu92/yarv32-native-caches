@@ -87,32 +87,46 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
 - `src/rtl/cache_cntrl.sv` — top-level cache controller: address split,
   tag RAM wiring, per-way tag compare, miss-handling FSM, SDRAM controller
   instance, plus the system address decode (bootrom, control register,
-  cache bypass — see "System address map").
+  cache bypass — see "System address map"). CPU-facing ports are the
+  yarv32-uc types bit-identically: `ifetch_req_t`/`ifetch_rsp_t` on the I
+  side (read-only, 64-bit, 2 outstanding), `mem_req_t`/`mem_rsp_t` on the
+  D side (32-bit, single-outstanding, posted stores).
 - `src/rtl/native_ram.sv` — generic single-clock BSRAM wrapper implementing
   the native `mem_req_t`/`mem_rsp_t` protocol (see below). Parametrized by
   `ADDR_W`, `DATA_WIDTH`, `READ_ONLY`. Used for bootrom, cache data
   macros, and tag macros.
-- `src/rtl/pkg/yarv32_cache_pkg.sv` — width-parametrizable protocol
-  struct pair. SystemVerilog packages cannot parameterize typedefs, so the
+- `src/rtl/pkg/yarv32_cache_pkg.sv` — the protocol types.
+  SystemVerilog packages cannot parameterize typedefs, so the
   `` `YARV_MEM_TYPES``/`` `YARV_MEM_REQ_T``/`` `YARV_MEM_RSP_T`` macros build
-  the req/rsp pair per (ADDR_W, DATA_W) with fixed field order/semantics.
-  The package instantiates the fixed-width variants: `mem_req_t` /
-  `mem_rsp_t` (64-bit data, `MEM_WIDTH`/`STRB_WIDTH`) and `cache_req_t` /
-  `cache_rsp_t` (256-bit data, `CACHE_WIDTH`). `native_ram` takes the pair
-  as `parameter type REQ_T/RSP_T` (defaults: the CPU-width pair), and
-  `cache_cntrl` defines local `way_req_t`/`way_rsp_t` (line width) and
-  `tag_req_t`/`tag_rsp_t` (tag width) from the same macros and passes them
-  to its macro instances — so port widths match at every width, verified by
-  elaboration-time `$bits` checks, and a WIDTH lint warning now means a
-  real bug (the sim Makefile no longer waives `WIDTH`/`WIDTHEXPAND`).
+  the req/rsp pair per (ADDR_W, DATA_W) with fixed field order/semantics;
+  the package instantiates `boot_req_t`/`boot_rsp_t` (64-bit data, the
+  bootrom macro and `native_ram`'s parameter defaults) and `cache_req_t`/
+  `cache_rsp_t` (256-bit line width) from them. The two CPU-facing pairs
+  are NOT macro-built — the ports have different field sets, so they are
+  hand-declared bit-identical to the yarv32-uc core's `rv32_pkg`
+  typedefs: `ifetch_req_t`/`ifetch_rsp_t` ($bits 34/66) and the 32-bit
+  `mem_req_t`/`mem_rsp_t` ($bits 71/35; note `mem_req_t` is now the
+  LSU pair, not the old 64-bit one). Field ORDER is load-bearing
+  (struct connections are packed-vector copies) and pinned by
+  elaboration-time `$bits` asserts in `cache_cntrl`. Width constants:
+  `NATIVE_ADDR_W` (32, every port's addr field), `IFETCH_DATA_W` (64),
+  `LSU_DATA_W` (32), `LSU_STRB_W` (4), `CACHE_WIDTH` (256); `MEM_WIDTH`/
+  `STRB_WIDTH` remain for the macro-built internal pairs. `native_ram`
+  takes its pair as `parameter type REQ_T/RSP_T` (defaults: the boot
+  pair), and `cache_cntrl` defines local `way_req_t`/`way_rsp_t` (line
+  width) and `tag_req_t`/`tag_rsp_t` (tag width) from the same macros and
+  passes them to its macro instances — so port widths match at every
+  width, verified by elaboration-time `$bits` checks, and a WIDTH lint
+  warning now means a real bug (the sim Makefile no longer waives
+  `WIDTH`/`WIDTHEXPAND`/`WIDTHTRUNC`).
 - `cache_cntrl` parameters beyond the geometry table below: `BOOTROM_FILE`
   (the bootrom's `$readmemh` image) and `CSR_RST_VAL` (the control
   register's power-on value). `fpga_top` forwards `BOOTROM_FILE`.
 - `native_ram` parameters: `ADDR_W`, `DATA_WIDTH`, `REQ_ADDR_W` (addr
-  field width, default `MEM_WIDTH`; the RAM decodes only the low `ADDR_W`
-  bits), `READ_ONLY`, `BYTE_WRITE`, `INIT_FILE` (optional `$readmemh`
-  preload, sim only), and `REQ_T`/`RSP_T` (protocol struct pair, see
-  above).
+  field width, default `NATIVE_ADDR_W`; the RAM decodes only the low
+  `ADDR_W` bits), `READ_ONLY`, `BYTE_WRITE`, `INIT_FILE` (optional
+  `$readmemh` preload, sim only), and `REQ_T`/`RSP_T` (protocol struct
+  pair, see above).
 - `BYTE_WRITE` is a RESOURCE parameter. Gowin BSRAM has no byte write
   enable, so GowinSynthesis builds one by splitting the array into
   byte-wide blocks: a 256-bit line macro becomes 32 BSRAMs instead of 8,
@@ -153,17 +167,18 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   `O_sdram_*` / `IO_sdram_dq` (the documented exception to the `*_i`/`*_o`
   convention); renaming one silently disconnects the SDRAM.
 - `src/rtl/cache_bist.sv` — bring-up traffic generator driving the two
-  CPU-facing native ports: 8 posted stores to ONE set with a different tag
-  each (a 2-way cache therefore evicts through the writeback path), the
-  same 8 addresses read back and compared, then I-port fetches checked for
-  liveness only (power-on SDRAM content is unknown). A watchdog turns a
-  stuck port into FAIL instead of a dark board. `fail_code_o` says which
-  failure it was (wrong data vs. a port that stopped answering, split by
-  port) and `fail_state_o` latches `cache_cntrl.dbg_state_o` — the miss
-  FSM's state — at that instant, so a hang says WHERE it hung. On a board
-  the LEDs are the only console there is. It also keeps the
-  synthesizer from pruning the whole subsystem: without it nothing drives
-  the request ports.
+  CPU-facing ports with the yarv32-uc types (`ifetch_*` fetches, 32-bit
+  `mem_*` stores/loads): 8 posted word stores to ONE set with a different
+  tag each (a 2-way cache therefore evicts through the writeback path),
+  the same 8 addresses read back and compared, then I-port fetches
+  checked for liveness only (power-on SDRAM content is unknown). A
+  watchdog turns a stuck port into FAIL instead of a dark board.
+  `fail_code_o` says which failure it was (wrong data vs. a port that
+  stopped answering, split by port) and `fail_state_o` latches
+  `cache_cntrl.dbg_state_o` — the miss FSM's state — at that instant, so a
+  hang says WHERE it hung. On a board the LEDs are the only console there
+  is. It also keeps the synthesizer from pruning the whole subsystem:
+  without it nothing drives the request ports.
 - `yarv32_cache.gprj`, `src/phys/yarv32_cache.cst` / `.sdc`, `impl/` —
   Gowin project (top `fpga_top`, `GW2AR-LV18QN88C8/I7`), pin constraints
   (clk PIN10, rst PIN88 active-high, LEDs 15-18; no SDRAM entries by
@@ -195,7 +210,7 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   misses picked up by the FSM, misses unstalled: the first count that
   stopped advancing is the step that never happened, which a final-state
   snapshot cannot tell you. `E` repeats the D-port bits live and `W` is the
-  handshake the BIST master sees (`{wready, rvalid, req.valid, we}`). On a
+  handshake the BIST master sees (`{wready, rvalid, req.wvalid, we}`). On a
   watchdog failure the BIST does NOT return to `S_DONE`: it HOLDS the stage
   that hung, keeping its request asserted, so the live fields describe the
   stall instead of the recovery from it — without that hold, a latched
@@ -209,28 +224,31 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   and decodes the debug UART so simulation prints the same status lines the
   board sends — the framing is proven before anything is flashed.
 - `sim/sim_top.sv` — Verilator testbench / sim top (clock, reset, drives
-  the I/D-cache `mem_req_t` interfaces, dumps `sim_top.vcd`). Compiles with
-  `--timing`. Self-checking phases with PASS/FAIL counters,
+  the I/D-cache ports with the yarv32-uc types, dumps `sim_top.vcd`).
+  Compiles with `--timing`. Self-checking phases with PASS/FAIL counters,
   expected-`rdata` checks, and a watchdog: A (I-hit way 0), D (response
   held with `rready=0` + 2 outstanding I-port reads returned in order), E
   (I-hit on way 1 alone — per-way comparator + hit-way data mux), F
   (simultaneous I+D hits), B (I-miss), M (the B miss completes: unstall
   serves the refilled data, re-request hits), C (D-hit), H (D-miss with
-  both ways valid), S (posted store hit, read-back, neighboring doubleword
-  untouched), V (dirty eviction with both ways valid: round-robin victim,
-  writeback to the victim's address, evicted line survives the round-trip)
-  V4 (store-miss write-allocate with a partial byte strobe merged
-  into the refilled line), R (bootrom reads on each port, both ports at
-  once through the arbiter, and a store to the ROM that must not stick),
-  X (control register reset value, write, read-back), Y (a bypass load of
-  an address whose cached copy is dirty — it must return what the DEVICE
-  holds) and Z (bypass stores, full-word and partial-strobe, round-tripped
-  through the device, then bypass cleared and the cached path checked
-  again). The R/X/Y/Z phases handshake through the `d_access` / `i_load`
-  tasks instead of counting cycles, because they mix latencies that differ
-  by two orders of magnitude. Preloads the tag/data macros by hierarchical
-  reference (`u_dut.gen_way[w].u_itag.mem` etc.) at time 0, indexed by the
-  plain set index (the DUT applies the `TAG_BYTES_W` shift itself).
+  both ways valid), S (posted store hit, read-back, neighboring word
+  untouched), S3/S4 (partial-strobe store hit, merged and
+  neighbour-checked), V (dirty eviction with both ways valid: round-robin
+  victim, writeback to the victim's address, evicted line survives the
+  round-trip), V4 (store-miss write-allocate with a byte strobe merged
+  into the refilled line), R (bootrom reads on each port — including the
+  D port's high-half select at `addr[2]=1` — both ports at once through
+  the arbiter, and a store to the ROM that must not stick), X (control
+  register reset value, write, read-back), Y (a bypass load of an address
+  whose cached copy is dirty — it must return what the DEVICE holds) and Z
+  (bypass stores, full-word and partial-strobe, round-tripped through the
+  device, then bypass cleared and the cached path checked again). The
+  R/X/Y/Z phases handshake through the `d_access` (32-bit) / `i_load`
+  (64-bit rdata) tasks instead of counting cycles, because they mix
+  latencies that differ by two orders of magnitude. Preloads the tag/data
+  macros by hierarchical reference (`u_dut.gen_way[w].u_itag.mem` etc.) at
+  time 0, indexed by the plain set index (the DUT applies the
+  `TAG_BYTES_W` shift itself).
 - SDRAM power-up: `cache_cntrl` holds the controller in reset for
   `SDRAM_INIT_US` (200 us) after `rstn_i`. JEDEC SDRAM ignores every
   command until it has seen stable clock and NOPs for at least 100 us; the
@@ -251,17 +269,39 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   checks hold at any clock rate). Violations count into `protocol_errors`,
   which both testbenches treat as a failure.
 
-## Protocol: mem_req_t / mem_rsp_t
+## Protocol: the two CPU-facing ports
 
-Custom native protocol, not AXI. See `native_ram.sv` header comment for
-full timing. Key points:
+Custom native protocol, not AXI. Both ports are 1:1 with the yarv32-uc
+core (rv32imac_zicsr_zifencei): type-identical to its `rv32_pkg`
+typedefs, so the core connects struct-to-struct with no glue. See
+`native_ram.sv` header comment for the memory-side timing of the same
+handshake shape.
 
-- Launch: `req.valid && rsp.wready` (`wready` = idle / can accept).
-- Read response: `rsp.rvalid && req.rready`, held until consumed
-  (compliance fix — not a one-cycle pulse).
-- Single-outstanding: one unread read response blocks new requests.
-- Store commits combinationally at the accept cycle; no B channel
-  (`bvalid` always low), posted-store semantics.
+**I port** (`ifetch_req_t`/`ifetch_rsp_t`, 64-bit, read-only):
+
+- Launch: `req.valid && rsp.ready` (note `ready`, not `wready` — the
+  fetch port has no write path).
+- Read response: `rsp.rvalid && req.rready`, held until consumed, 64-bit
+  `rdata` (two 32-bit words, low word first).
+- Up to 2 reads outstanding; responses always in request (accept) order —
+  the fetch unit's in-flight-PC tracking relies on it (it needs its own
+  depth-2 shadow FIFO for variable latency; the cache guarantees order,
+  nothing more).
+- Address is 8-byte aligned in steady state; the cache returns the
+  aligned doubleword selected by `addr[4:3]` regardless of `addr[2]` —
+  the core picks its half of `rdata`.
+
+**D port** (`mem_req_t`/`mem_rsp_t`, 32-bit, single-outstanding):
+
+- Launch: `req.wvalid && rsp.wready`.
+- Read response: `rsp.rvalid && req.rready`, held until consumed,
+  32-bit `rdata`. One unread response blocks new requests.
+- Byte-strobed stores (`wstrb`), word-aligned addresses. Store commits
+  at the accept cycle; no B channel (`bvalid` always low), posted-store
+  semantics — the core retires stores at launch-accept.
+- The core routes its MMIO (address bit 28) to its own AXI4-Lite master;
+  such addresses never reach this port, and the cache does not decode
+  bit 28.
 
 ## The reset chain needs a defined power-up state
 
@@ -341,6 +381,17 @@ is one word wide per line: `DATA_WIDTH = 2^(CL_SIZE+3) = 256` bits, so a
 whole line is stored in a single 256-bit BSRAM word. SDRAM refill/writeback
 moves `BURST_LEN = DATA_WIDTH/32 = 8` words over the 32-bit SDRAM data bus.
 
+Per-port CPU access widths (the two ports differ): the I port fetches a
+64-bit doubleword selected by `addr[NBIT_OFFSET-1:3]` (registered as
+`cmp_dw_sel_q`), the D port moves one 32-bit word selected by
+`addr[NBIT_OFFSET-1:2]` (registered as `dcmp_word_sel_q`). The internal
+state is split to match — `iskid_q`/`rq_i_q` hold 64-bit I requests and
+responses, `dskid_q`/`rq_d_q` hold 32-bit D ones, `miss_addr_q` is a
+32-bit byte address — while all shared 1-bit control stays in
+`[N_CACHE][...]` vectors so the per-cache loops survive. Addresses above
+bit 23 are ignored by the region decode (see below), so a 32-bit CPU
+address costs nothing extra.
+
 Tag word layout: `rdata[0]=valid`, `rdata[1]=dirty`, `rdata[2+:TAG_FIELD_W]=tag`.
 
 Two non-obvious details in this wiring:
@@ -352,11 +403,12 @@ Two non-obvious details in this wiring:
   consecutive sets alias to the same tag word.
 - Struct-to-struct port connections are packed-vector assignments (no
   strict type checking), so every width that appears on a native-protocol
-  port must come from the same macro expansion as its counterpart —
+  port must come from the same expansion as its counterpart —
   `way_req_t`/`way_rsp_t` for the data macros, `tag_req_t`/`tag_rsp_t`
-  for the tag macros, `mem_req_t`/`mem_rsp_t` for the CPU side and
-  bootrom. Verilator `WIDTH` warnings are no longer waived in
-  `sim/Makefile`, so a mismatched pair fails the build.
+  for the tag macros, `boot_req_t`/`boot_rsp_t` for the bootrom, and the
+  hand-declared CPU pairs on the port side. Verilator `WIDTH` warnings
+  are no longer waived in `sim/Makefile`, so a mismatched pair fails the
+  build.
 
 Set-associativity is implemented via a `generate for (w = 0; w < N_WAY; w++)`
 loop instantiating `N_WAY` parallel `native_ram` macros for data and for
@@ -375,9 +427,12 @@ parallel (`N_WAY` comparators per cache), not time-multiplexed.
 
 The SDRAM needs 23 address bits for its 8 MiB, so bit 23 is free and is
 what separates memory from everything else. `yarv32_cache_pkg` holds the
-map and the `yarv_region` decode; only bits `[23]` and `[12]` are looked
-at, so each peripheral aliases through its 4 KiB window and address bits
-above 23 are ignored.
+map and the `yarv_region` decode (over the full 32-bit CPU address); only
+bits `[23]` and `[12]` are looked at, so each peripheral aliases through
+its 4 KiB window and address bits above 23 are ignored. (The core's own
+MMIO window is address bit 28 — the core routes those accesses to its
+AXI4-Lite master and they never reach the cache, which is why the map
+does not decode it.)
 
 | Range                 | Target                                     |
 |-----------------------|--------------------------------------------|
@@ -391,20 +446,24 @@ Both CPU ports reach it (the fetch side runs the boot code, the load side
 reads the payload) and the macro has one port, so the two are arbitrated
 with the D port winning ties — the same fixed priority the miss FSM uses;
 the loser retries the next cycle. A store to the ROM region retires as a
-posted no-op. `cache_cntrl`'s `BOOTROM_FILE` parameter (forwarded from
+posted no-op. A 32-bit D load returns HALF of the 64-bit bootrom word,
+selected by `addr[2]` (low half when 0) — the bootrom macro is 64-bit
+data, the D port's word select only reaches `addr[4:2]`, so the half is
+picked at the response side, where the slot (and its address) is still
+held. `cache_cntrl`'s `BOOTROM_FILE` parameter (forwarded from
 `fpga_top`) is its `$readmemh` image; `sim/bootrom.hex` is the
 simulation one, word *i* = `{32'hB0070000+i, 32'hC0DE0000+i}`.
 
 The control register is `CSR_W` = 8 bits, byte 0 of the addressed
 doubleword. Bit `CSR_BIT_BYPASS` (0) is CACHE_BYPASS: while it is set,
 SDRAM loads and stores skip the cache arrays entirely and the miss FSM
-moves the doubleword straight to/from the device (`S_BP_*` states, two
-32-bit words; a store word that is not fully strobed is read-modify-
-written, because the controller drives `dqm` itself and the pins cannot
-mask it). The rest of the register is readable/writable scratch. Only the
-D port may write it — the I port is read-only by spec, so a store there
-is dropped — and both ports may read it. `CSR_RST_VAL` (default 0) is its
-power-on value.
+moves the access straight to/from the device (`S_BP_*` states — one
+32-bit word for a D access, two for a 64-bit I doubleword; a store word
+that is not fully strobed is read-modify-written, because the controller
+drives `dqm` itself and the pins cannot mask it). The rest of the
+register is readable/writable scratch. Only the D port may write it —
+the I port is read-only by spec, so a store there is dropped — and both
+ports may read it. `CSR_RST_VAL` (default 0) is its power-on value.
 
 Bypass is NOT a coherence mechanism: a line cached before the bit was set
 stays cached and stale. It exists for the boot sequence, where a loader
@@ -454,6 +513,14 @@ completion signals. Remaining open items, marked `TODO` in source:
   not a measured optimum.
 - The board build has never been run: synthesis, PnR and timing closure at
   50 MHz are the open Phase-6 items (TODO.md).
+- The CPU-facing interface is 1:1 with the yarv32-uc core since Phase 10
+  (TODO.md, 2026-09-06): two typed ports, 64-bit read-only I / 32-bit
+  byte-strobed D, whole-struct skid copies per port. The 4-state
+  gate-level check (`make gatesim`) and `make lint-yosys` have NOT been
+  re-run against the new per-port datapaths (tools not installed;
+  skipped by decision) — the split skid/queue state has only seen
+  Verilator's 2-state zeroing, `--x-initial unique`, and
+  `+RAM_GARBAGE`. Run them before trusting a board build.
 - No boot image exists yet: `BOOTROM_FILE` defaults to `""` on the board
   build, and an uninitialised read-only array is a constant that
   GowinSynthesis may build as one (see `native_ram`'s `ram_style`
