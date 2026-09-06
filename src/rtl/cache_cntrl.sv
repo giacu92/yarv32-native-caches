@@ -201,6 +201,29 @@ module cache_cntrl #(
                 1 << (TAG_ADDR_W - TAG_BYTES_W),
                 N_SETS
             );
+        // CPU-facing type shape pins: these are hand-declared to be
+        // bit-identical to the yarv32-uc core's rv32_pkg typedefs, so a
+        // field-order or width drift there silently misconnects (a
+        // struct-to-struct connection is a packed-vector copy). Pin the
+        // packed widths the core's docs state.
+        assert ($bits(yarv32_cache_pkg::ifetch_req_t) == 34)
+        else
+            $fatal(
+                1,
+                "ifetch_req_t is %0d bits, rv32_pkg says 34",
+                $bits(
+                    yarv32_cache_pkg::ifetch_req_t
+                )
+            );
+        assert ($bits(yarv32_cache_pkg::ifetch_rsp_t) == 66)
+        else
+            $fatal(
+                1,
+                "ifetch_rsp_t is %0d bits, rv32_pkg says 66",
+                $bits(
+                    yarv32_cache_pkg::ifetch_rsp_t
+                )
+            );
     end
 `endif
 
@@ -308,9 +331,9 @@ module cache_cntrl #(
     //   TGT_CSR   : control register read/write
     // -------------------------------------------------------------
     localparam logic [1:0] TGT_CACHE = 2'd0;
-    localparam logic [1:0] TGT_MEM = 2'd1;
-    localparam logic [1:0] TGT_BOOT = 2'd2;
-    localparam logic [1:0] TGT_CSR = 2'd3;
+    localparam logic [1:0] TGT_MEM   = 2'd1;
+    localparam logic [1:0] TGT_BOOT  = 2'd2;
+    localparam logic [1:0] TGT_CSR   = 2'd3;
 
     logic [N_CACHE-1:0][N_SLOT-1:0][1:0] slot_tgt_q;  // target of each occupied slot
     logic [N_CACHE-1:0][1:0] acc_tgt;  // target of the request being offered now
