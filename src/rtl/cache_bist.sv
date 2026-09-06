@@ -7,14 +7,15 @@ import yarv32_cache_pkg::*;
 /**
  * Cache built-in self test — board bring-up traffic generator.
  *
- * Drives the cache controller's CPU-facing native ports (`mem_req_t` /
- * `mem_rsp_t`) with a fixed, self-checking sequence so an FPGA build has
+ * Drives the cache controller's CPU-facing ports (the yarv32-uc interface:
+ * read-only 64-bit `ifetch_*` on the I side, byte-strobed 32-bit `mem_*` on
+ * the D side) with a fixed, self-checking sequence so an FPGA build has
  * something real to exercise before a CPU is attached. Without it the
  * synthesizer would prune the whole cache subsystem (no driver on the
  * request ports, no consumer of the responses).
  *
  * Sequence (all on the D-port unless stated):
- *   1. STORE   — N_ADDR posted 64-bit stores of a per-index pattern.
+ *   1. STORE   — N_ADDR posted 32-bit word stores of a per-index pattern.
  *      Every address maps to the SAME set (stride = N_SETS * 2**CL_SIZE),
  *      with a different tag each, so a 2-way cache takes N_ADDR store
  *      misses, write-allocates them dirty, and evicts all but the last
@@ -57,9 +58,9 @@ module cache_bist #(
     input wire clk_i,
     input wire rstn_i,
 
-    // I-cache port (read-only traffic)
-    output mem_req_t icache_req_o,
-    input  mem_rsp_t icache_rsp_i,
+    // I-cache port (read-only fetch traffic, 64-bit)
+    output ifetch_req_t icache_req_o,
+    input  ifetch_rsp_t icache_rsp_i,
 
     // D-cache port (store + load traffic)
     output mem_req_t dcache_req_o,
@@ -97,7 +98,7 @@ module cache_bist #(
     output wire [3:0] dbg_idx_o,
 
     // The D-port handshake as this master sees it, live:
-    //   [3] rsp.wready  [2] rsp.rvalid  [1] req.valid  [0] req.we
+    //   [3] rsp.wready  [2] rsp.rvalid  [1] req.wvalid  [0] req.we
     // With the hang hold below these are the values AT the stall, not
     // after it has been abandoned.
     output wire [3:0] dbg_hs_o
@@ -107,7 +108,7 @@ module cache_bist #(
     // over every set. Consecutive test addresses differ only in the tag.
     localparam int SET_STRIDE = N_SETS * (1 << CL_SIZE);
 
-    // Doubleword-aligned offset inside the line (64-bit accesses).
+    // Word-aligned offset inside the line (32-bit accesses).
     localparam int LINE_OFFSET = 8;
 
     // I-port region: far from the D-port addresses so the two never share
@@ -121,12 +122,12 @@ module cache_bist #(
     // -------------------------------------------------------------------
 
     // Address under test for index i, and the pattern stored there.
-    function automatic logic [MEM_WIDTH-1:0] test_addr(input logic [IDX_W-1:0] i);
-        test_addr = MEM_WIDTH'(i * SET_STRIDE + LINE_OFFSET);
+    function automatic logic [NATIVE_ADDR_W-1:0] test_addr(input logic [IDX_W-1:0] i);
+        test_addr = NATIVE_ADDR_W'(i * SET_STRIDE + LINE_OFFSET);
     endfunction
 
-    function automatic logic [MEM_WIDTH-1:0] test_data(input logic [IDX_W-1:0] i);
-        test_data = {32'h5A5A_0000 | 32'(i), 32'hCAFE_0000 | 32'(i)};
+    function automatic logic [LSU_DATA_W-1:0] test_data(input logic [IDX_W-1:0] i);
+        test_data = 32'hCAFE_0000 | 32'(i);
     endfunction
 
     // -------------------------------------------------------------------
@@ -176,8 +177,8 @@ module cache_bist #(
     logic [WDOG_W-1:0] wdog_q, wdog_d;
 
     // Request drivers (combinational off the state).
-    mem_req_t icache_req;
-    mem_req_t dcache_req;
+    ifetch_req_t icache_req;
+    mem_req_t    dcache_req;
 
     always_comb begin
         state_d      = state_q;
@@ -202,13 +203,13 @@ module cache_bist #(
                 state_d = S_STORE;
             end
 
-            // Posted store: accepted on valid && wready, no response.
+            // Posted store: accepted on wvalid && wready, no response.
             S_STORE: begin
-                dcache_req.valid = 1'b1;
-                dcache_req.we    = 1'b1;
-                dcache_req.addr  = test_addr(idx_q);
-                dcache_req.wdata = test_data(idx_q);
-                dcache_req.wstrb = {STRB_WIDTH{1'b1}};
+                dcache_req.wvalid = 1'b1;
+                dcache_req.we     = 1'b1;
+                dcache_req.addr   = test_addr(idx_q);
+                dcache_req.wdata  = test_data(idx_q);
+                dcache_req.wstrb  = {LSU_STRB_W{1'b1}};
                 if (dcache_rsp_i.wready) begin
                     wdog_d = '0;
                     if (int'(idx_q) == N_ADDR - 1) begin
@@ -221,7 +222,7 @@ module cache_bist #(
             end
 
             S_LOAD_REQ: begin
-                dcache_req.valid  = 1'b1;
+                dcache_req.wvalid = 1'b1;
                 dcache_req.addr   = test_addr(idx_q);
                 dcache_req.rready = 1'b1;
                 if (dcache_rsp_i.wready) begin
@@ -255,9 +256,9 @@ module cache_bist #(
 
             S_FETCH_REQ: begin
                 icache_req.valid  = 1'b1;
-                icache_req.addr   = MEM_WIDTH'(IFETCH_BASE) + MEM_WIDTH'(idx_q * SET_STRIDE);
+                icache_req.addr   = IFETCH_BASE + NATIVE_ADDR_W'(idx_q * SET_STRIDE);
                 icache_req.rready = 1'b1;
-                if (icache_rsp_i.wready) begin
+                if (icache_rsp_i.ready) begin
                     wdog_d  = '0;
                     state_d = S_FETCH_RSP;
                 end
@@ -335,7 +336,7 @@ module cache_bist #(
     assign fail_dport_o = fail_dport_q;
     assign dbg_stage_o = 4'(state_q);
     assign dbg_idx_o = 4'(idx_q);
-    assign dbg_hs_o = {dcache_rsp_i.wready, dcache_rsp_i.rvalid, dcache_req.valid, dcache_req.we};
+    assign dbg_hs_o = {dcache_rsp_i.wready, dcache_rsp_i.rvalid, dcache_req.wvalid, dcache_req.we};
 
     assign busy_o = (state_q != S_DONE) && !hung_q;
     assign pass_o = (state_q == S_DONE) && !fail_q;

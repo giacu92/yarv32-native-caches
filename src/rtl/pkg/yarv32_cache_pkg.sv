@@ -65,15 +65,14 @@ package yarv32_cache_pkg;
     localparam int unsigned CACHE_WIDTH = 256;
     localparam int unsigned CACHE_STRB_WIDTH = CACHE_WIDTH / 8;
 
-    // CPU-side native protocol: 64-bit data, 64-bit byte address.
+    // Legacy macro-pair width constants: the line-width pair below and
+    // the internal line/tag macro expansions in cache_cntrl still use
+    // them (64-bit data words there, not the CPU widths).
     localparam int unsigned MEM_WIDTH = 64;
     localparam int unsigned STRB_WIDTH = MEM_WIDTH / 8;
 
-    // Native protocol, CPU width: fetch/LSU side, bootrom.
-    `YARV_MEM_TYPES(mem_req_t, mem_rsp_t, MEM_WIDTH, MEM_WIDTH)
-
     // Native protocol, cache-line width: cache data macros.
-    `YARV_MEM_TYPES(cache_req_t, cache_rsp_t, MEM_WIDTH, CACHE_WIDTH)
+    `YARV_MEM_TYPES(cache_req_t, cache_rsp_t, NATIVE_ADDR_W, CACHE_WIDTH)
 
     // Bootrom protocol: same macro shape, but 32-bit byte address. The
     // bootrom macro stays 64-bit data (the I port fetches 8 bytes), so
@@ -102,6 +101,27 @@ package yarv32_cache_pkg;
         logic [IFETCH_DATA_W-1:0] rdata;  // two 32-bit words, low word first
     } ifetch_rsp_t;
 
+    // Data (LSU) port (D side): 32-bit read/write, byte-strobed,
+    // single-outstanding. Stores are posted (retire at accept; the core
+    // ignores bvalid, which stays low). Addresses are word-aligned by the
+    // core; bit-28 addresses are the core's MMIO and go to its AXI4-Lite
+    // master — they never reach this port.
+    typedef struct packed {
+        logic wvalid;  // request valid
+        logic we;  // 1 = write, 0 = read
+        logic [NATIVE_ADDR_W-1:0] addr;  // byte address, word-aligned
+        logic [LSU_DATA_W-1:0] wdata;  // write data (ignored if we=0)
+        logic [LSU_STRB_W-1:0] wstrb;  // byte strobes; all-1 on a word store
+        logic rready;  // master ready for read data
+    } mem_req_t;
+
+    typedef struct packed {
+        logic wready;  // slave accepts the request
+        logic rvalid;  // read data valid this cycle
+        logic [LSU_DATA_W-1:0] rdata;  // read data
+        logic bvalid;  // write ack — stores are posted, held low
+    } mem_rsp_t;
+
     // ------------------------------------------------------------------
     // System address map (24 bit). The SDRAM needs 23 bits for its 8 MiB,
     // so bit 23 is free and separates memory from everything else:
@@ -124,7 +144,7 @@ package yarv32_cache_pkg;
     // Bootrom depth: 2 KiB (ADDR_W of its native_ram instance).
     localparam int unsigned BOOTROM_ADDR_W = 11;
 
-    // Control register: 8 bits, byte 0 of the addressed doubleword.
+    // Control register: 8 bits, byte 0 of the addressed word.
     //   [0] CACHE_BYPASS — SDRAM loads and stores go straight to the
     //       device, leaving the cache arrays untouched. Set it while a
     //       loader writes a program into SDRAM, so the program is really
@@ -140,7 +160,7 @@ package yarv32_cache_pkg;
     localparam logic [1:0] RGN_BOOT = 2'd1;
     localparam logic [1:0] RGN_CSR = 2'd2;
 
-    function automatic logic [1:0] yarv_region(input logic [MEM_WIDTH-1:0] a);
+    function automatic logic [1:0] yarv_region(input logic [NATIVE_ADDR_W-1:0] a);
         if (!a[SYS_MEM_BIT]) yarv_region = RGN_MEM;
         else if (!a[SYS_CSR_BIT]) yarv_region = RGN_BOOT;
         else yarv_region = RGN_CSR;

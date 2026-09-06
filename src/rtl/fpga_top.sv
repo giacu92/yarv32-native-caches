@@ -103,7 +103,9 @@ module fpga_top #(
     //   9 = tag invalidation sweep at reset (the gate-level root cause)
     //  10 = defined power-up state for the reset chain (Initialize_Primitives)
     //  11 = single external reset, registered, no POR counter / lock gate
-    localparam logic [3:0] BUILD_ID = 4'd11;
+    //  12 = yarv32-uc CPU interface: 64-bit read-only I port (ifetch_*),
+    //       32-bit byte-strobed D port (mem_*)
+    localparam logic [3:0] BUILD_ID = 4'd12;
 
     // -------------------------------------------------------------------
     // Clock generation
@@ -184,35 +186,35 @@ module fpga_top #(
         rst_sync_q <= {rst_sync_q[0], rst_i};
     end
 
-    wire             rstn_core = ~rst_sync_q[1];
+    wire                rstn_core = ~rst_sync_q[1];
 
     // -------------------------------------------------------------------
     // Cache subsystem + bring-up self test
     // -------------------------------------------------------------------
 
-    mem_req_t        icache_req;
-    mem_rsp_t        icache_rsp;
-    mem_req_t        dcache_req;
-    mem_rsp_t        dcache_rsp;
+    ifetch_req_t        icache_req;
+    ifetch_rsp_t        icache_rsp;
+    mem_req_t           dcache_req;
+    mem_rsp_t           dcache_rsp;
 
-    wire             bist_busy;
-    wire             bist_pass;
-    wire             bist_fail;
-    wire      [ 1:0] bist_fail_code;
-    wire      [ 3:0] bist_fail_state;
-    wire      [ 3:0] bist_fail_stage;
-    wire      [ 3:0] bist_fail_dport;
-    wire      [ 3:0] cache_dbg_state;
-    wire      [ 3:0] cache_dbg_dport;
-    wire      [15:0] cache_dbg_cnt;
-    wire      [ 3:0] cache_dbg_acc;
-    wire      [ 3:0] cache_dbg_go;
-    wire      [ 3:0] cache_dbg_rsp;
-    wire      [ 3:0] cache_dbg_tick;
-    wire             cache_dbg_hb;
-    wire      [ 3:0] bist_dbg_stage;
-    wire      [ 3:0] bist_dbg_idx;
-    wire      [ 3:0] bist_dbg_hs;
+    wire                bist_busy;
+    wire                bist_pass;
+    wire                bist_fail;
+    wire         [ 1:0] bist_fail_code;
+    wire         [ 3:0] bist_fail_state;
+    wire         [ 3:0] bist_fail_stage;
+    wire         [ 3:0] bist_fail_dport;
+    wire         [ 3:0] cache_dbg_state;
+    wire         [ 3:0] cache_dbg_dport;
+    wire         [15:0] cache_dbg_cnt;
+    wire         [ 3:0] cache_dbg_acc;
+    wire         [ 3:0] cache_dbg_go;
+    wire         [ 3:0] cache_dbg_rsp;
+    wire         [ 3:0] cache_dbg_tick;
+    wire                cache_dbg_hb;
+    wire         [ 3:0] bist_dbg_stage;
+    wire         [ 3:0] bist_dbg_idx;
+    wire         [ 3:0] bist_dbg_hs;
 
     cache_bist u_bist (
         .clk_i       (clk_core),

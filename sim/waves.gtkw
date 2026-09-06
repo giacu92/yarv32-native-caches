@@ -1,15 +1,15 @@
 [*]
 [*] GTKWave Analyzer v3.3.126 (w)1999-2026 BSI
-[*] Mon Aug 31 21:09:08 2026
+[*] Mon Aug 31 21:51:52 2026
 [*]
 [dumpfile] "/home/giacomo/gowin_proj/yarv-native-cache/sim/sim_top.vcd"
-[dumpfile_mtime] "Mon Aug 31 21:07:59 2026"
-[dumpfile_size] 106191
+[dumpfile_mtime] "Mon Aug 31 21:34:02 2026"
+[dumpfile_size] 294984
 [savefile] "/home/giacomo/gowin_proj/yarv-native-cache/sim/waves.gtkw"
 [timestart] 0
 [size] 1920 1105
 [pos] -1 -1
-*-16.514429 185000 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+*-18.376587 185000 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
 [treeopen] sim_top.
 [treeopen] sim_top.u_dut.
 [treeopen] sim_top.u_dut.gen_way[0].
@@ -20,20 +20,15 @@
 @28
 sim_top.u_dut.clk_i
 sim_top.u_dut.rstn_i
-@201
--
 @200
+-
 -Read Req - IMEM
 @28
 sim_top.u_dut.icache_req_valid
 @22
-sim_top.u_dut.icache_req_addr[63:0]
+sim_top.u_dut.icache_req_addr[31:0]
 @28
 sim_top.u_dut.icache_req_rready
-sim_top.u_dut.icache_req_we
-@22
-sim_top.u_dut.icache_req_wdata[63:0]
-sim_top.u_dut.icache_req_wstrb[7:0]
 @200
 -
 @22
@@ -69,7 +64,7 @@ sim_top.u_dut.sdrc_init_done
 sim_top.u_dut.sdrc_data_out[31:0]
 @200
 -
--
+-ICACHE0
 @22
 sim_top.u_dut.gen_way[0].u_icache.word_addr[6:0]
 @28
@@ -80,6 +75,7 @@ sim_top.u_dut.gen_way[0].u_icache.rsp_done
 @22
 sim_top.u_dut.gen_way[0].u_icache.rdata_q[255:0]
 @200
+-
 -
 -
 -

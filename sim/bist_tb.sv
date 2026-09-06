@@ -34,7 +34,7 @@ module bist_tb;
     // hold.
     // Covers the 200 us SDRAM power-up wait plus the test and, on a
     // failure, the post-mortem report line.
-    localparam time TIMEOUT = 900us;
+    localparam time TIMEOUT  = 900us;
 
     logic clk;
     logic rst;

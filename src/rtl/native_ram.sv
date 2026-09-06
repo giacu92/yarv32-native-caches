@@ -59,7 +59,7 @@ module native_ram #(
     parameter int DATA_WIDTH = 32,
     // Width of the request's addr field (byte address). The RAM decodes
     // only the low ADDR_W bits; extra MSBs are simply not sampled.
-    parameter int REQ_ADDR_W = yarv32_cache_pkg::MEM_WIDTH,
+    parameter int REQ_ADDR_W = yarv32_cache_pkg::NATIVE_ADDR_W,
     // 1 = read-only I-mem (fetch); 0 = read/write D-mem (LSU, byte-strobed).
     parameter bit READ_ONLY = 0,
     // 1 = per-byte write enables (wstrb selects which bytes commit).
@@ -79,10 +79,11 @@ module native_ram #(
     parameter string INIT_FILE = "",
     // Native-protocol struct pair, normally built with the
     // `YARV_MEM_TYPES macro at (REQ_ADDR_W, DATA_WIDTH). Defaults are the
-    // CPU-width pair. Width safety is enforced by the elaboration checks
-    // below (a mismatched REQ_T/RSP_T is caught, not silently truncated).
-    parameter type REQ_T = yarv32_cache_pkg::mem_req_t,
-    parameter type RSP_T = yarv32_cache_pkg::mem_rsp_t
+    // bootrom pair (64-bit data, the widest fixed user). Width safety is
+    // enforced by the elaboration checks below (a mismatched REQ_T/RSP_T
+    // is caught, not silently truncated).
+    parameter type REQ_T = yarv32_cache_pkg::boot_req_t,
+    parameter type RSP_T = yarv32_cache_pkg::boot_rsp_t
 ) (
     input wire clk_i,
     input wire rstn_i,

@@ -31,14 +31,14 @@ import yarv32_cache_pkg::*;
  *   H: D-cache miss with BOTH ways valid (neither tag matches)
  *   S: D-cache store hit (posted, no response): data-macro write into the
  *      hit way + dirty bit; a following load returns the stored value and
- *      the line's other doublewords are untouched (byte-strobe positioning)
+ *      the line's other words are untouched (byte-strobe positioning)
  *   V: full dirty eviction (set 77, both ways valid): a store makes way
  *      0's line dirty, a miss to the same set evicts it (round-robin
  *      victim, both ways valid) and the writeback must land at the VICTIM's
  *      SDRAM address — re-loading the evicted address returns the stored
  *      value via the writeback round-trip. V4: a store MISS (tag 0x444,
- *      same set) is write-allocated — only the low 4 bytes of doubleword 0
- *      are strobed, so the merged line must keep SDRAM's high 4 bytes.
+ *      same set) is write-allocated — only byte 0 of word 0 is strobed,
+ *      so the merged line must keep SDRAM's high 3 bytes.
  */
 
 module sim_top;
@@ -49,21 +49,21 @@ module sim_top;
     initial clk = 1'b0;
     initial forever #5 clk = ~clk;
 
-    mem_req_t        icache_req;
-    mem_rsp_t        icache_rsp;
-    mem_req_t        dcache_req;
-    mem_rsp_t        dcache_rsp;
+    ifetch_req_t        icache_req;
+    ifetch_rsp_t        icache_rsp;
+    mem_req_t           dcache_req;
+    mem_rsp_t           dcache_rsp;
 
-    wire             sdram_clk_o;
-    wire             sdram_cke_o;
-    wire             sdram_cs_n_o;
-    wire             sdram_cas_n_o;
-    wire             sdram_ras_n_o;
-    wire             sdram_wen_n_o;
-    wire      [ 3:0] sdram_dqm_o;
-    wire      [10:0] sdram_addr_o;
-    wire      [ 1:0] sdram_ba_o;
-    wire      [31:0] sdram_dq_io;
+    wire                sdram_clk_o;
+    wire                sdram_cke_o;
+    wire                sdram_cs_n_o;
+    wire                sdram_cas_n_o;
+    wire                sdram_ras_n_o;
+    wire                sdram_wen_n_o;
+    wire         [ 3:0] sdram_dqm_o;
+    wire         [10:0] sdram_addr_o;
+    wire         [ 1:0] sdram_ba_o;
+    wire         [31:0] sdram_dq_io;
 
     cache_cntrl #(
         .BOOTROM_FILE("bootrom.hex")
@@ -124,24 +124,29 @@ module sim_top;
     localparam int NBIT_TAG = TAG_FIELD_W + 2;
     localparam int TAG_DATA_W = ((NBIT_TAG + 7) / 8) * 8;
 
-    localparam logic [22:0] ADDR_I_HIT = 23'h3C_D1A5;
-    localparam logic [22:0] ADDR_I_MISS = 23'h00_2000;
-    localparam logic [22:0] ADDR_D_HIT = 23'h00_0000;
+    localparam logic [23:0] ADDR_I_HIT = 24'h3C_D1A5;
+    localparam logic [23:0] ADDR_I_MISS = 24'h00_2000;
+    localparam logic [23:0] ADDR_D_HIT = 24'h00_0000;
 
     localparam logic [255:0] LINE_PATTERN =
         256'h8778_7667_6556_5445_4334_3223_2112_1001_DDEE_DDCC_BBAA_9988_7766_5544_3322_1100;
 
-    // Both hit addresses have addr[4:3]=0, so the expected 64-bit response
+    // Both hit addresses have addr[4:3]=0, so the expected 64-bit I response
     // is always doubleword 0 of the preloaded line.
     localparam logic [63:0] EXP_DW0 = LINE_PATTERN[63:0];
 
     // Phase-D second read: same line as ADDR_I_HIT, doubleword 1.
-    localparam logic [22:0] ADDR_I_HIT_DW1 = ADDR_I_HIT + 23'd8;
+    localparam logic [23:0] ADDR_I_HIT_DW1 = ADDR_I_HIT + 23'd8;
     localparam logic [63:0] EXP_DW1 = LINE_PATTERN[127:64];
+
+    // D-port word expectations from the same preloaded line: the D port is
+    // 32-bit, word i of the line = LINE_PATTERN[32*i +: 32].
+    localparam logic [31:0] EXP_W0 = LINE_PATTERN[31:0];
+    localparam logic [31:0] EXP_W1 = LINE_PATTERN[63:32];
 
     // Phase-E way-1 hit: way 1 alone is valid in set 40 (tag 0x1AB), with
     // its own line pattern so a stuck-at-way-0 data mux is caught.
-    localparam logic [22:0] ADDR_I_WAY1 = 23'h1AB500;
+    localparam logic [23:0] ADDR_I_WAY1 = 24'h1AB500;
     localparam logic [255:0] LINE_PATTERN_W1 =
         256'hF0E1D2C3B4A5968778695A4B3C2D1E0FDEADBEEFCAFEBABE0123456789ABCDEF;
     localparam logic [63:0] EXP_W1_DW0 = LINE_PATTERN_W1[63:0];
@@ -149,45 +154,45 @@ module sim_top;
     // Phase-H D-miss with BOTH ways valid: the requested tag (0x300) differs
     // from way 0's (0x111) and way 1's (0x222) in set 41 — only the tag
     // equality can rule out a hit on either way.
-    localparam logic [22:0] ADDR_D_MISS2 = 23'h300520;
+    localparam logic [23:0] ADDR_D_MISS2 = 24'h300520;
 
     localparam int DATA_WORD_I_WAY1 = int'(ADDR_I_WAY1[NBIT_OFFSET+:NBIT_SET_IDX]);
 
-    // Phase-S store value (posted store hit at ADDR_D_HIT, doubleword 0).
-    localparam logic [63:0] STORE_VAL = 64'h1234_5678_9ABC_DEF0;
+    // Phase-S store value (posted store hit at ADDR_D_HIT, word 0).
+    localparam logic [31:0] STORE_VAL_W = 32'h9ABC_DEF0;
 
-    // Phase S3: partial-strobe store hit (bytes 4 and 5 only) over the
-    // STORE_VAL written by Phase S, and the merged value it must produce.
-    localparam logic [63:0] PARTIAL_VAL = 64'hFFFF_A5A5_FFFF_FFFF;
-    localparam logic [63:0] EXP_PARTIAL = {STORE_VAL[63:48], PARTIAL_VAL[47:32], STORE_VAL[31:0]};
+    // Phase S3: partial-strobe store hit (byte 1 only) over the STORE_VAL_W
+    // written by Phase S, and the merged value it must produce.
+    localparam logic [31:0] PARTIAL_VAL = 32'hFFFF_A5A5;
+    localparam logic [31:0] EXP_PARTIAL = {STORE_VAL_W[31:16], PARTIAL_VAL[15:8], STORE_VAL_W[7:0]};
 
     // Phase-V dirty eviction, set 77 (0x4D): way 0 holds line A (tag 0x111),
     // way 1 holds a valid filler line (tag 0x333), so a miss on tag 0x222
     // forces a round-robin victim (both ways valid). Both addresses are
     // offset 0, so doubleword 0 is the first two SDRAM words of each line.
-    localparam logic [22:0] ADDR_A_EV = 23'h1119A0;  // set 77, tag 0x111
-    localparam logic [22:0] ADDR_B_EV = 23'h2229A0;  // set 77, tag 0x222
-    localparam logic [22:0] ADDR_A_EV_DW1 = ADDR_A_EV + 23'd8;
+    localparam logic [23:0] ADDR_A_EV = 24'h1119A0;  // set 77, tag 0x111
+    localparam logic [23:0] ADDR_B_EV = 24'h2229A0;  // set 77, tag 0x222
+    localparam logic [23:0] ADDR_A_EV_W1 = ADDR_A_EV + 23'd4;  // word 1 of line A
 
-    // V4/V5 write-allocate test: store-miss into a non-resident line (tag
-    // 0x444, same set), strobing only the low 4 bytes of doubleword 0 —
-    // the merged line must keep SDRAM's high 4 bytes of that doubleword.
-    localparam logic [22:0] ADDR_C_EV = 23'h4449A0;  // set 77, tag 0x444
+    // V4 write-allocate test: store-miss into a non-resident line (tag
+    // 0x444, same set), strobing only byte 0 of word 0 — the merged line
+    // must keep SDRAM's high 3 bytes of that word.
+    localparam logic [23:0] ADDR_C_EV = 24'h4449A0;  // set 77, tag 0x444
 
     // Data-macro word index (addr[NBIT_OFFSET +: NBIT_SET_IDX]): the data
     // macros are indexed by the raw CPU address, one 256-bit word per set.
     localparam int DATA_WORD_I_HIT = int'(ADDR_I_HIT[NBIT_OFFSET+:NBIT_SET_IDX]);
     localparam int DATA_WORD_D_HIT = int'(ADDR_D_HIT[NBIT_OFFSET+:NBIT_SET_IDX]);
 
-    function automatic logic [NBIT_SET_IDX-1:0] set_of(input logic [22:0] addr);
+    function automatic logic [NBIT_SET_IDX-1:0] set_of(input logic [23:0] addr);
         set_of = addr[NBIT_OFFSET+:NBIT_SET_IDX];
     endfunction
 
-    function automatic logic [TAG_FIELD_W-1:0] tag_of(input logic [22:0] addr);
+    function automatic logic [TAG_FIELD_W-1:0] tag_of(input logic [23:0] addr);
         tag_of = addr[MEM_SIZE-1:NBIT_OFFSET+NBIT_SET_IDX];
     endfunction
 
-    function automatic logic [TAG_DATA_W-1:0] tag_word(input logic [22:0] addr);
+    function automatic logic [TAG_DATA_W-1:0] tag_word(input logic [23:0] addr);
         tag_word = {{(TAG_DATA_W - TAG_FIELD_W - 2) {1'b0}}, tag_of(addr), 1'b0, 1'b1};
     endfunction
 
@@ -198,17 +203,17 @@ module sim_top;
     // SDRAM stub backing-store pattern: mem[i] = 32'hCAFE0000 | i[15:0],
     // i = byte address >> 2. Expected doubleword 0 of the line at a
     // line-aligned address = {word(addr+4), word(addr)}.
-    function automatic logic [31:0] sdram_word(input logic [22:0] byte_addr);
+    function automatic logic [31:0] sdram_word(input logic [23:0] byte_addr);
         sdram_word = {16'hCAFE, byte_addr[17:2]};
     endfunction
 
-    function automatic logic [63:0] sdram_line_dw0(input logic [22:0] line_addr);
+    function automatic logic [63:0] sdram_line_dw0(input logic [23:0] line_addr);
         sdram_line_dw0 = {sdram_word(line_addr + 23'd4), sdram_word(line_addr)};
     endfunction
 
-    // V4/V5: expected doubleword 0 of the write-allocated line — the store
-    // strobes only the low 4 bytes, so the high 4 stay the SDRAM pattern.
-    localparam logic [63:0] MERGE_VAL = {sdram_word(ADDR_C_EV + 23'd4), STORE_VAL[31:0]};
+    // V4: expected word 0 of the write-allocated line — the store strobes
+    // only byte 0, so the high 3 bytes stay the SDRAM pattern.
+    localparam logic [31:0] MERGE_VAL = {sdram_word(ADDR_C_EV) [31:8], STORE_VAL_W[7:0]};
 
     initial begin
         $display("[sim_top] TAG_FIELD_W=%0d TAG_DATA_W=%0d", TAG_FIELD_W, TAG_DATA_W);
@@ -273,20 +278,31 @@ module sim_top;
     integer error_count;
     integer wait_rsp;
     integer wait_fsm;
-    logic   saw_fsm;
+    logic saw_fsm;
 
     // Scratch for the handshaking phases (R/X/Y/Z) below.
-    logic [63:0] rd_d, rd_i;
+    logic [63:0] rd_i;
+    logic [31:0] rd_d;
     logic ok_d, ok_i;
 
     // Bootrom image (sim/bootrom.hex): word i = {B007_0000+i, C0DE_0000+i}.
-    function automatic logic [63:0] boot_word(input int i);
-        boot_word = {32'hB007_0000 + 32'(i), 32'hC0DE_0000 + 32'(i)};
+    // A 64-bit I fetch returns the whole word; a 32-bit D load returns half
+    // of it, selected by addr[2] (low half when addr[2]=0).
+    function automatic logic [31:0] boot_lo(input int i);
+        boot_lo = 32'hC0DE_0000 + 32'(i);
     endfunction
 
-    // SDRAM byte address of a doubleword, as the CPU sees it.
-    function automatic logic [63:0] a64(input logic [23:0] a);
-        a64 = {{(64 - 24) {1'b0}}, a};
+    function automatic logic [31:0] boot_hi(input int i);
+        boot_hi = 32'hB007_0000 + 32'(i);
+    endfunction
+
+    function automatic logic [63:0] boot_word(input int i);
+        boot_word = {boot_hi(i), boot_lo(i)};
+    endfunction
+
+    // 24-bit system address zero-extended to the CPU's 32-bit byte address.
+    function automatic logic [31:0] a32(input logic [23:0] a);
+        a32 = {{(32 - 24) {1'b0}}, a};
     endfunction
 
     // -----------------------------------------------------------------
@@ -296,10 +312,10 @@ module sim_top;
     // to be accepted, then wait for the response (a load) or for the port
     // to go idle again (a posted store).
     // -----------------------------------------------------------------
-    task automatic d_access(input logic [63:0] addr, input logic we, input logic [63:0] wdata,
-                            input logic [7:0] wstrb, output logic [63:0] rdata, output logic ok);
+    task automatic d_access(input logic [31:0] addr, input logic we, input logic [31:0] wdata,
+                            input logic [3:0] wstrb, output logic [31:0] rdata, output logic ok);
         int guard;
-        dcache_req.valid  = 1'b1;
+        dcache_req.wvalid = 1'b1;
         dcache_req.we     = we;
         dcache_req.addr   = addr;
         dcache_req.wdata  = wdata;
@@ -311,11 +327,11 @@ module sim_top;
             guard = guard + 1;
         end
         @(posedge clk);  // accepted at this edge
-        dcache_req.valid = 1'b0;
-        dcache_req.we    = 1'b0;
-        rdata            = '0;
-        ok               = 1'b0;
-        guard            = 0;
+        dcache_req.wvalid = 1'b0;
+        dcache_req.we     = 1'b0;
+        rdata             = '0;
+        ok                = 1'b0;
+        guard             = 0;
         if (we) begin
             while (!dcache_rsp.wready && guard < 2000) begin
                 @(posedge clk);
@@ -333,14 +349,13 @@ module sim_top;
         end
     endtask
 
-    task automatic i_load(input logic [63:0] addr, output logic [63:0] rdata, output logic ok);
+    task automatic i_load(input logic [31:0] addr, output logic [63:0] rdata, output logic ok);
         int guard;
         icache_req.valid  = 1'b1;
-        icache_req.we     = 1'b0;
         icache_req.addr   = addr;
         icache_req.rready = 1'b1;
         guard             = 0;
-        while (!icache_rsp.wready && guard < 2000) begin
+        while (!icache_rsp.ready && guard < 2000) begin
             @(posedge clk);
             guard = guard + 1;
         end
@@ -381,8 +396,7 @@ module sim_top;
         // hit signal is a one-cycle pulse per lookup, not a steady level).
         // ----
         icache_req.valid  = 1'b1;
-        icache_req.we     = 1'b0;
-        icache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_I_HIT};
+        icache_req.addr   = a32(ADDR_I_HIT);
         icache_req.rready = 1'b1;
 
         wait_rsp          = 0;
@@ -416,11 +430,10 @@ module sim_top;
         repeat (4) @(posedge clk);
 
         icache_req.valid  = 1'b1;
-        icache_req.we     = 1'b0;
-        icache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_I_HIT};
+        icache_req.addr   = a32(ADDR_I_HIT);
         icache_req.rready = 1'b0;  // hold A's response
         @(posedge clk);  // A accepted
-        icache_req.addr = {{(64 - 23) {1'b0}}, ADDR_I_HIT_DW1};
+        icache_req.addr = a32(ADDR_I_HIT_DW1);
         @(posedge clk);  // B accepted while A is unconsumed
         icache_req.valid = 1'b0;  // stop issuing; A and B are in flight
 
@@ -439,11 +452,11 @@ module sim_top;
         end else begin
             $display("PASS  D1: icache response held with rready=0 (rdata=%h)", icache_rsp.rdata);
         end
-        if (icache_rsp.wready) begin
+        if (icache_rsp.ready) begin
             error_count = error_count + 1;
-            $display("FAIL  D2: wready high with 2 outstanding I-port reads");
+            $display("FAIL  D2: ready high with 2 outstanding I-port reads");
         end else begin
-            $display("PASS  D2: wready low with 2 outstanding I-port reads");
+            $display("PASS  D2: ready low with 2 outstanding I-port reads");
         end
 
         // Consume both, in accept order (A is held at the head).
@@ -473,7 +486,7 @@ module sim_top;
         // comparator that ignores way 1 is caught by the rdata check.
         // ----
         icache_req.valid  = 1'b1;
-        icache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_I_WAY1};
+        icache_req.addr   = a32(ADDR_I_WAY1);
         icache_req.rready = 1'b1;
         wait_rsp          = 0;
         while (!icache_rsp.rvalid && wait_rsp < 20) begin
@@ -499,11 +512,11 @@ module sim_top;
         // carry their own cache's data (per-cache independence).
         // ----
         icache_req.valid  = 1'b1;
-        icache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_I_HIT};
+        icache_req.addr   = a32(ADDR_I_HIT);
         icache_req.rready = 1'b1;
-        dcache_req.valid  = 1'b1;
+        dcache_req.wvalid = 1'b1;
         dcache_req.we     = 1'b0;
-        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_D_HIT};
+        dcache_req.addr   = a32(ADDR_D_HIT);
         dcache_req.rready = 1'b1;
 
         wait_rsp          = 0;
@@ -520,7 +533,7 @@ module sim_top;
             error_count = error_count + 1;
             $display("FAIL  F: simultaneous I response wrong (rvalid=%b rdata=%h)",
                      icache_rsp.rvalid, icache_rsp.rdata);
-        end else if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_DW0) begin
+        end else if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_W0) begin
             error_count = error_count + 1;
             $display("FAIL  F: simultaneous D response wrong (rvalid=%b rdata=%h)",
                      dcache_rsp.rvalid, dcache_rsp.rdata);
@@ -528,8 +541,8 @@ module sim_top;
             $display("PASS  F: simultaneous I+D hits both served (I rdata=%h D rdata=%h)",
                      icache_rsp.rdata, dcache_rsp.rdata);
         end
-        icache_req.valid = 1'b0;
-        dcache_req.valid = 1'b0;
+        icache_req.valid  = 1'b0;
+        dcache_req.wvalid = 1'b0;
         repeat (4) @(posedge clk);  // drain
 
         // ---- Phase B: I-cache miss. The set is preloaded with a VALID tag
@@ -537,8 +550,7 @@ module sim_top;
         // and the FSM never leaves S_IDLE (caught by the timeout).
         // ----
         icache_req.valid = 1'b1;  // Phase F cleared it; re-issue
-        icache_req.we    = 1'b0;
-        icache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_I_MISS};
+        icache_req.addr  = a32(ADDR_I_MISS);
         wait_fsm         = 0;
         while (u_dut.state_q == 0 && wait_fsm < 30) begin
             @(posedge clk);
@@ -573,8 +585,7 @@ module sim_top;
         repeat (4) @(posedge clk);  // drain leftover queue entries (rready=1)
 
         icache_req.valid  = 1'b1;
-        icache_req.we     = 1'b0;
-        icache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_I_MISS};
+        icache_req.addr   = a32(ADDR_I_MISS);
         icache_req.rready = 1'b1;
         wait_rsp          = 0;
         saw_fsm           = 0;
@@ -601,9 +612,9 @@ module sim_top;
         repeat (2) @(posedge clk);
 
         // ---- Phase C: D-cache hit ----
-        dcache_req.valid  = 1'b1;
+        dcache_req.wvalid = 1'b1;
         dcache_req.we     = 1'b0;
-        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_D_HIT};
+        dcache_req.addr   = a32(ADDR_D_HIT);
         dcache_req.rready = 1'b1;
         wait_rsp          = 0;
         while (!dcache_rsp.rvalid && wait_rsp < 20) begin
@@ -613,15 +624,15 @@ module sim_top;
         if (!dcache_rsp.rvalid) begin
             error_count = error_count + 1;
             $display("FAIL  C: no dcache rvalid at 0x%0h within %0d cycles", ADDR_D_HIT, wait_rsp);
-        end else if (dcache_rsp.rdata !== EXP_DW0) begin
+        end else if (dcache_rsp.rdata !== EXP_W0) begin
             error_count = error_count + 1;
-            $display("FAIL  C: dcache rdata at 0x%0h expected %h, got %h", ADDR_D_HIT, EXP_DW0,
+            $display("FAIL  C: dcache rdata at 0x%0h expected %h, got %h", ADDR_D_HIT, EXP_W0,
                      dcache_rsp.rdata);
         end else begin
             $display("PASS  C: dcache HIT at 0x%0h (set=%0d rdata=%h, %0d cycles)", ADDR_D_HIT,
                      set_of(ADDR_D_HIT), dcache_rsp.rdata, wait_rsp);
         end
-        dcache_req.valid = 1'b0;
+        dcache_req.wvalid = 1'b0;
 
         // ---- Phase H: D-cache miss with BOTH ways valid (set 41: way 0
         // tag 0x111, way 1 tag 0x222, requested 0x300) — the miss-detection
@@ -629,15 +640,15 @@ module sim_top;
         // a false hit, and the FSM must take the miss (which now completes
         // and unstalls the port; the completion datapath is checked in M/V).
         // ----
-        wait_fsm         = 0;
+        wait_fsm          = 0;
         while (u_dut.state_q != 0 && wait_fsm < 400) begin
             @(posedge clk);  // let any in-flight FSM transit settle
             wait_fsm = wait_fsm + 1;
         end
         repeat (4) @(posedge clk);  // drain Phase-C leftovers (rready=1 pops them)
-        dcache_req.valid  = 1'b1;
+        dcache_req.wvalid = 1'b1;
         dcache_req.we     = 1'b0;
-        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_D_MISS2};
+        dcache_req.addr   = a32(ADDR_D_MISS2);
         dcache_req.rready = 1'b1;
         wait_fsm          = 0;
         while (u_dut.state_q == 0 && !dcache_rsp.rvalid && wait_fsm < 30) begin
@@ -656,16 +667,16 @@ module sim_top;
             $display("PASS  H: dcache MISS with both ways valid at 0x%0h (FSM state=%0s)",
                      ADDR_D_MISS2, u_dut.state_q.name());
         end
-        dcache_req.valid = 1'b0;
+        dcache_req.wvalid = 1'b0;
 
         // ---- Phase S: D-cache store hit (posted). The store must NOT
         // produce a response; the data-macro write into the hit way and the
         // dirty-bit tag write land at the tag-answer pulse. A following
-        // load of the same doubleword must return the stored value, and the
-        // line's other doublewords must be untouched (byte-strobe
-        // positioning at cmp_dw_sel_q).
+        // load of the same word must return the stored value, and the
+        // line's other words must be untouched (byte-strobe positioning
+        // at dcmp_word_sel_q).
         // ----
-        wait_fsm         = 0;
+        wait_fsm          = 0;
         while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[1]) && wait_fsm < 400) begin
             @(posedge clk);  // let the Phase-H transit (and any duplicate
             // re-accepted request while valid was held) finish
@@ -673,15 +684,15 @@ module sim_top;
         end
         repeat (4) @(posedge clk);  // drain Phase-H leftovers (rready=1 pops them)
 
-        dcache_req.valid  = 1'b1;
+        dcache_req.wvalid = 1'b1;
         dcache_req.we     = 1'b1;
-        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_D_HIT};
-        dcache_req.wdata  = STORE_VAL;
-        dcache_req.wstrb  = 8'hFF;  // all 8 bytes of doubleword 0
+        dcache_req.addr   = a32(ADDR_D_HIT);
+        dcache_req.wdata  = STORE_VAL_W;
+        dcache_req.wstrb  = 4'hF;  // all 4 bytes of word 0
         dcache_req.rready = 1'b1;
         repeat (4) @(posedge clk);  // accept -> lookup -> pulse/write (posted)
-        dcache_req.valid = 1'b0;
-        dcache_req.we    = 1'b0;
+        dcache_req.wvalid = 1'b0;
+        dcache_req.we     = 1'b0;
         repeat (2) @(posedge clk);
         if (dcache_rsp.rvalid) begin
             error_count = error_count + 1;
@@ -690,63 +701,63 @@ module sim_top;
             $display("PASS  S0: posted store hit, no response");
         end
 
-        // Load back the stored doubleword.
-        dcache_req.valid = 1'b1;
-        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_D_HIT};
-        wait_rsp         = 0;
+        // Load back the stored word.
+        dcache_req.wvalid = 1'b1;
+        dcache_req.addr   = a32(ADDR_D_HIT);
+        wait_rsp          = 0;
         while (!dcache_rsp.rvalid && wait_rsp < 20) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
         end
-        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== STORE_VAL) begin
+        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== STORE_VAL_W) begin
             error_count = error_count + 1;
-            $display("FAIL  S1: stored doubleword not read back (rvalid=%b expected %h got %h)",
-                     dcache_rsp.rvalid, STORE_VAL, dcache_rsp.rdata);
+            $display("FAIL  S1: stored word not read back (rvalid=%b expected %h got %h)",
+                     dcache_rsp.rvalid, STORE_VAL_W, dcache_rsp.rdata);
         end else begin
-            $display("PASS  S1: stored doubleword read back (rdata=%h)", dcache_rsp.rdata);
+            $display("PASS  S1: stored word read back (rdata=%h)", dcache_rsp.rdata);
         end
-        dcache_req.valid = 1'b0;
+        dcache_req.wvalid = 1'b0;
         repeat (2) @(posedge clk);
 
-        // Load the next doubleword: must be untouched by the store above.
-        dcache_req.valid = 1'b1;
-        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_D_HIT + 23'd8};
-        wait_rsp         = 0;
+        // Load the next word: must be untouched by the store above.
+        dcache_req.wvalid = 1'b1;
+        dcache_req.addr   = a32(ADDR_D_HIT + 23'd4);
+        wait_rsp          = 0;
         while (!dcache_rsp.rvalid && wait_rsp < 20) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
         end
-        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_DW1) begin
+        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_W1) begin
             error_count = error_count + 1;
-            $display("FAIL  S2: store clobbered the next doubleword (rvalid=%b expected %h got %h)",
-                     dcache_rsp.rvalid, EXP_DW1, dcache_rsp.rdata);
+            $display("FAIL  S2: store clobbered the next word (rvalid=%b expected %h got %h)",
+                     dcache_rsp.rvalid, EXP_W1, dcache_rsp.rdata);
         end else begin
-            $display("PASS  S2: next doubleword untouched by store (rdata=%h)", dcache_rsp.rdata);
+            $display("PASS  S2: next word untouched by store (rdata=%h)", dcache_rsp.rdata);
         end
-        dcache_req.valid = 1'b0;
+        dcache_req.wvalid = 1'b0;
         repeat (2) @(posedge clk);
 
         // ---- Phase S3: PARTIAL-strobe store hit. The data macros take
         // whole-word writes only (native_ram BYTE_WRITE=0 — Gowin BSRAM
         // has no byte write enable, and inferring one costs 4x the
         // blocks), so a partial store is a read-modify-write of the line
-        // the hit way already has on its output. Bytes 4-5 of doubleword 0
-        // must change and every other byte of the line must survive.
+        // the hit way already has on its output. Byte 1 of word 0 must
+        // change and every other byte of the line must survive.
         // ----
-        dcache_req.valid  = 1'b1;
+        dcache_req.wvalid = 1'b1;
         dcache_req.we     = 1'b1;
-        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_D_HIT};
+        dcache_req.addr   = a32(ADDR_D_HIT);
         dcache_req.wdata  = PARTIAL_VAL;
-        dcache_req.wstrb  = 8'h30;  // bytes 4 and 5 only
+        dcache_req.wstrb  = 4'b0010;  // byte 1 only
         dcache_req.rready = 1'b1;
         repeat (4) @(posedge clk);
-        dcache_req.valid = 1'b0;
-        dcache_req.we    = 1'b0;
+        dcache_req.wvalid = 1'b0;
+        dcache_req.we     = 1'b0;
         repeat (2) @(posedge clk);
 
-        dcache_req.valid = 1'b1;
-        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_D_HIT};
-        wait_rsp         = 0;
+        dcache_req.wvalid = 1'b1;
+        dcache_req.addr   = a32(ADDR_D_HIT);
+        wait_rsp          = 0;
         while (!dcache_rsp.rvalid && wait_rsp < 20) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
@@ -759,26 +770,26 @@ module sim_top;
         end else begin
             $display("PASS  S3: partial-strobe store hit merged (rdata=%h)", dcache_rsp.rdata);
         end
-        dcache_req.valid = 1'b0;
+        dcache_req.wvalid = 1'b0;
         repeat (2) @(posedge clk);
 
-        // Neighbouring doubleword must still be untouched after the
-        // read-modify-write of doubleword 0.
-        dcache_req.valid = 1'b1;
-        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_D_HIT + 23'd8};
-        wait_rsp         = 0;
+        // Neighbouring word must still be untouched after the
+        // read-modify-write of word 0.
+        dcache_req.wvalid = 1'b1;
+        dcache_req.addr   = a32(ADDR_D_HIT + 23'd4);
+        wait_rsp          = 0;
         while (!dcache_rsp.rvalid && wait_rsp < 20) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
         end
-        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_DW1) begin
+        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_W1) begin
             error_count = error_count + 1;
-            $display("FAIL  S4: partial store clobbered the next doubleword (expected %h got %h)",
-                     EXP_DW1, dcache_rsp.rdata);
+            $display("FAIL  S4: partial store clobbered the next word (expected %h got %h)",
+                     EXP_W1, dcache_rsp.rdata);
         end else begin
-            $display("PASS  S4: next doubleword untouched by the partial store");
+            $display("PASS  S4: next word untouched by the partial store");
         end
-        dcache_req.valid = 1'b0;
+        dcache_req.wvalid = 1'b0;
         repeat (2) @(posedge clk);
 
         // ---- Phase V: full dirty eviction (D-cache, set 77, both ways
@@ -790,23 +801,23 @@ module sim_top;
         // wrong address (e.g. the missing line's) fails V2; a clobbered
         // refill fails V1.
         // ----
-        // 1. Store to A (way-0 hit in set 77): dw0 = STORE_VAL, dirty=1.
-        dcache_req.valid  = 1'b1;
+        // 1. Store to A (way-0 hit in set 77): word 0 = STORE_VAL_W, dirty=1.
+        dcache_req.wvalid = 1'b1;
         dcache_req.we     = 1'b1;
-        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_A_EV};
-        dcache_req.wdata  = STORE_VAL;
-        dcache_req.wstrb  = 8'hFF;
+        dcache_req.addr   = a32(ADDR_A_EV);
+        dcache_req.wdata  = STORE_VAL_W;
+        dcache_req.wstrb  = 4'hF;
         dcache_req.rready = 1'b1;
         repeat (4) @(posedge clk);
-        dcache_req.valid = 1'b0;
-        dcache_req.we    = 1'b0;
+        dcache_req.wvalid = 1'b0;
+        dcache_req.we     = 1'b0;
         repeat (2) @(posedge clk);
 
         // 2. Load B (set 77, tag 0x222): miss; victim way 0 is dirty ->
         //    writeback + refill; response must be B's own SDRAM pattern.
-        dcache_req.valid = 1'b1;
-        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_B_EV};
-        wait_rsp         = 0;
+        dcache_req.wvalid = 1'b1;
+        dcache_req.addr   = a32(ADDR_B_EV);
+        wait_rsp          = 0;
         while (!dcache_rsp.rvalid && wait_rsp < 400) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
@@ -814,22 +825,22 @@ module sim_top;
         if (!dcache_rsp.rvalid) begin
             error_count = error_count + 1;
             $display("FAIL  V1: evicting miss at 0x%0h never completed", ADDR_B_EV);
-        end else if (dcache_rsp.rdata !== sdram_line_dw0(ADDR_B_EV)) begin
+        end else if (dcache_rsp.rdata !== sdram_word(ADDR_B_EV)) begin
             error_count = error_count + 1;
             $display("FAIL  V1: B's refill data wrong after eviction (expected %h got %h)",
-                     sdram_line_dw0(ADDR_B_EV), dcache_rsp.rdata);
+                     sdram_word(ADDR_B_EV), dcache_rsp.rdata);
         end else begin
             $display("PASS  V1: dirty eviction completed, B served (rdata=%h)", dcache_rsp.rdata);
         end
-        dcache_req.valid = 1'b0;
+        dcache_req.wvalid = 1'b0;
         repeat (2) @(posedge clk);
 
         // 3. Load A again: it was evicted in step 2, so this misses again
         //    (victim = way 1, the clean filler — no writeback) and must
-        //    read back the line written back in step 2: dw0 = STORE_VAL.
-        dcache_req.valid = 1'b1;
-        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_A_EV};
-        wait_rsp         = 0;
+        //    read back the line written back in step 2: word 0 = STORE_VAL_W.
+        dcache_req.wvalid = 1'b1;
+        dcache_req.addr   = a32(ADDR_A_EV);
+        wait_rsp          = 0;
         while (!dcache_rsp.rvalid && wait_rsp < 400) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
@@ -837,58 +848,58 @@ module sim_top;
         if (!dcache_rsp.rvalid) begin
             error_count = error_count + 1;
             $display("FAIL  V2: re-load of evicted address 0x%0h never completed", ADDR_A_EV);
-        end else if (dcache_rsp.rdata !== STORE_VAL) begin
+        end else if (dcache_rsp.rdata !== STORE_VAL_W) begin
             error_count = error_count + 1;
             $display("FAIL  V2: evicted line lost/corrupted by writeback (expected %h got %h)",
-                     STORE_VAL, dcache_rsp.rdata);
+                     STORE_VAL_W, dcache_rsp.rdata);
         end else begin
             $display("PASS  V2: evicted line survived the writeback round-trip (rdata=%h)",
                      dcache_rsp.rdata);
         end
-        dcache_req.valid = 1'b0;
+        dcache_req.wvalid = 1'b0;
         repeat (2) @(posedge clk);
 
-        // 4. dw1 of A: the store only touched dw0, so the rest of the line
-        //    must still be the preloaded pattern after both round-trips.
-        dcache_req.valid = 1'b1;
-        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_A_EV_DW1};
-        wait_rsp         = 0;
+        // 4. Word 1 of A: the store only touched word 0, so the rest of
+        //    the line must still be the preloaded pattern after both
+        //    round-trips.
+        dcache_req.wvalid = 1'b1;
+        dcache_req.addr   = a32(ADDR_A_EV_W1);
+        wait_rsp          = 0;
         while (!dcache_rsp.rvalid && wait_rsp < 400) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
         end
-        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_DW1) begin
+        if (!dcache_rsp.rvalid || dcache_rsp.rdata !== EXP_W1) begin
             error_count = error_count + 1;
-            $display(
-                "FAIL  V3: line's second doubleword wrong after round-trip (expected %h got %h)",
-                EXP_DW1, dcache_rsp.rdata);
+            $display("FAIL  V3: line's second word wrong after round-trip (expected %h got %h)",
+                     EXP_W1, dcache_rsp.rdata);
         end else begin
             $display("PASS  V3: rest of line intact after round-trip (rdata=%h)", dcache_rsp.rdata);
         end
-        dcache_req.valid  = 1'b0;
+        dcache_req.wvalid = 1'b0;
 
         // 5. Store MISS (write-allocate): storing to a non-resident line
         //    (tag 0x444, set 77) must refill, merge the store into the
         //    line, and commit it DIRTY; a re-load returns the stored value.
-        dcache_req.valid  = 1'b1;
+        dcache_req.wvalid = 1'b1;
         dcache_req.we     = 1'b1;
-        dcache_req.addr   = {{(64 - 23) {1'b0}}, ADDR_C_EV};
-        dcache_req.wdata  = STORE_VAL;
-        dcache_req.wstrb  = 8'h0F;  // only the low 4 bytes of doubleword 0
+        dcache_req.addr   = a32(ADDR_C_EV);
+        dcache_req.wdata  = STORE_VAL_W;
+        dcache_req.wstrb  = 4'h1;  // only byte 0 of word 0
         dcache_req.rready = 1'b1;
         repeat (4) @(posedge clk);
-        dcache_req.valid = 1'b0;
-        dcache_req.we    = 1'b0;
-        wait_fsm         = 0;
+        dcache_req.wvalid = 1'b0;
+        dcache_req.we     = 1'b0;
+        wait_fsm          = 0;
         while ((u_dut.state_q != 0 || u_dut.slot_miss_wait[1]) && wait_fsm < 400) begin
             @(posedge clk);  // let the write-allocate refill finish
             wait_fsm = wait_fsm + 1;
         end
         repeat (4) @(posedge clk);  // drain leftovers (rready=1 pops them)
 
-        dcache_req.valid = 1'b1;
-        dcache_req.addr  = {{(64 - 23) {1'b0}}, ADDR_C_EV};
-        wait_rsp         = 0;
+        dcache_req.wvalid = 1'b1;
+        dcache_req.addr   = a32(ADDR_C_EV);
+        wait_rsp          = 0;
         while (!dcache_rsp.rvalid && wait_rsp < 400) begin
             @(posedge clk);
             wait_rsp = wait_rsp + 1;
@@ -900,21 +911,34 @@ module sim_top;
         end else begin
             $display("PASS  V4: store miss write-allocated + merged (rdata=%h)", dcache_rsp.rdata);
         end
-        dcache_req.valid = 1'b0;
+        dcache_req.wvalid = 1'b0;
 
         // ---- Phase R: bootrom (0x80_0000, read-only, both ports).
         // The image is sim/bootrom.hex; word i sits at BOOTROM_BASE + 8*i.
+        // A 64-bit I fetch reads the whole word; a 32-bit D load sees half
+        // of it, selected by addr[2] (low half at addr[2]=0).
         // ----
-        d_access(a64(24'h80_0000 + 24'd16), 1'b0, '0, 8'h00, rd_d, ok_d);
-        if (!ok_d || rd_d !== boot_word(2)) begin
+        d_access(a32(24'h80_0000 + 24'd16), 1'b0, '0, 4'h0, rd_d, ok_d);
+        if (!ok_d || rd_d !== boot_lo(2)) begin
             error_count = error_count + 1;
-            $display("FAIL  R1: bootrom D-port read (ok=%b expected %h got %h)", ok_d, boot_word(2
-                     ), rd_d);
+            $display("FAIL  R1: bootrom D-port read (ok=%b expected %h got %h)", ok_d, boot_lo(2),
+                     rd_d);
         end else begin
-            $display("PASS  R1: bootrom read on the D port (rdata=%h)", rd_d);
+            $display("PASS  R1: bootrom read on the D port, low half (rdata=%h)", rd_d);
         end
 
-        i_load(a64(24'h80_0000 + 24'd40), rd_i, ok_i);
+        // The D port's HIGH half of the same bootrom word (addr[2]=1): the
+        // only coverage of the D-side half-select.
+        d_access(a32(24'h80_0000 + 24'd20), 1'b0, '0, 4'h0, rd_d, ok_d);
+        if (!ok_d || rd_d !== boot_hi(2)) begin
+            error_count = error_count + 1;
+            $display("FAIL  R1b: bootrom D-port read, high half (ok=%b expected %h got %h)", ok_d,
+                     boot_hi(2), rd_d);
+        end else begin
+            $display("PASS  R1b: bootrom read on the D port, high half (rdata=%h)", rd_d);
+        end
+
+        i_load(a32(24'h80_0000 + 24'd40), rd_i, ok_i);
         if (!ok_i || rd_i !== boot_word(5)) begin
             error_count = error_count + 1;
             $display("FAIL  R2: bootrom I-port read (ok=%b expected %h got %h)", ok_i, boot_word(5
@@ -926,10 +950,10 @@ module sim_top;
         // Both ports at once: the bootrom is ONE macro, so the two
         // requests are arbitrated. Both answers must still be right.
         fork
-            i_load(a64(24'h80_0000 + 24'd8), rd_i, ok_i);
-            d_access(a64(24'h80_0000 + 24'd2040), 1'b0, '0, 8'h00, rd_d, ok_d);
+            i_load(a32(24'h80_0000 + 24'd8), rd_i, ok_i);
+            d_access(a32(24'h80_0000 + 24'd2040), 1'b0, '0, 4'h0, rd_d, ok_d);
         join
-        if (!ok_i || rd_i !== boot_word(1) || !ok_d || rd_d !== boot_word(255)) begin
+        if (!ok_i || rd_i !== boot_word(1) || !ok_d || rd_d !== boot_lo(255)) begin
             error_count = error_count + 1;
             $display("FAIL  R3: arbitrated bootrom reads (I ok=%b %h, D ok=%b %h)", ok_i, rd_i,
                      ok_d, rd_d);
@@ -938,9 +962,9 @@ module sim_top;
         end
 
         // A store to the ROM must retire without changing it.
-        d_access(a64(24'h80_0000 + 24'd16), 1'b1, 64'hDEAD_BEEF_DEAD_BEEF, 8'hFF, rd_d, ok_d);
-        d_access(a64(24'h80_0000 + 24'd16), 1'b0, '0, 8'h00, rd_d, ok_d);
-        if (!ok_d || rd_d !== boot_word(2)) begin
+        d_access(a32(24'h80_0000 + 24'd16), 1'b1, 32'hDEAD_BEEF, 4'hF, rd_d, ok_d);
+        d_access(a32(24'h80_0000 + 24'd16), 1'b0, '0, 4'h0, rd_d, ok_d);
+        if (!ok_d || rd_d !== boot_lo(2)) begin
             error_count = error_count + 1;
             $display("FAIL  R4: store to the bootrom changed it (got %h)", rd_d);
         end else begin
@@ -948,17 +972,17 @@ module sim_top;
         end
 
         // ---- Phase X: control register (0x80_1000, 8 bit, RW). ----
-        d_access(a64(24'h80_1000), 1'b0, '0, 8'h00, rd_d, ok_d);
-        if (!ok_d || rd_d !== 64'd0) begin
+        d_access(a32(24'h80_1000), 1'b0, '0, 4'h0, rd_d, ok_d);
+        if (!ok_d || rd_d !== 32'd0) begin
             error_count = error_count + 1;
             $display("FAIL  X1: control register reset value (ok=%b got %h)", ok_d, rd_d);
         end else begin
             $display("PASS  X1: control register reads 0 out of reset");
         end
 
-        d_access(a64(24'h80_1000), 1'b1, 64'h0000_0000_0000_00A5, 8'h01, rd_d, ok_d);
-        d_access(a64(24'h80_1000), 1'b0, '0, 8'h00, rd_d, ok_d);
-        if (!ok_d || rd_d !== 64'h0000_0000_0000_00A5) begin
+        d_access(a32(24'h80_1000), 1'b1, 32'h0000_00A5, 4'h1, rd_d, ok_d);
+        d_access(a32(24'h80_1000), 1'b0, '0, 4'h0, rd_d, ok_d);
+        if (!ok_d || rd_d !== 32'h0000_00A5) begin
             error_count = error_count + 1;
             $display("FAIL  X2: control register write/read back (got %h)", rd_d);
         end else begin
@@ -966,51 +990,51 @@ module sim_top;
         end
 
         // ---- Phase Y: cache bypass, loads.
-        // Address 0 is DIRTY in the D-cache (Phase S stored STORE_VAL into
+        // Address 0 is DIRTY in the D-cache (Phase S stored STORE_VAL_W into
         // it and nothing has evicted set 0 since), so SDRAM still holds the
         // power-on pattern there. With CACHE_BYPASS set the load must
         // return what the DEVICE holds, not what the cache holds — which
         // is exactly the distinction the bit exists to make.
         // ----
-        d_access(a64(24'h80_1000), 1'b1, 64'd1, 8'h01, rd_d, ok_d);  // bypass on
+        d_access(a32(24'h80_1000), 1'b1, 32'd1, 4'h1, rd_d, ok_d);  // bypass on
 
-        d_access(a64(24'h00_0000), 1'b0, '0, 8'h00, rd_d, ok_d);
-        if (!ok_d || rd_d !== sdram_line_dw0(23'h00_0000)) begin
+        d_access(a32(24'h00_0000), 1'b0, '0, 4'h0, rd_d, ok_d);
+        if (!ok_d || rd_d !== sdram_word(24'h00_0000)) begin
             error_count = error_count + 1;
-            $display("FAIL  Y1: bypass load (ok=%b expected %h got %h)", ok_d, sdram_line_dw0(
-                     23'h00_0000), rd_d);
+            $display("FAIL  Y1: bypass load (ok=%b expected %h got %h)", ok_d, sdram_word(
+                     24'h00_0000), rd_d);
         end else begin
             $display("PASS  Y1: bypass load read the device, not the dirty line (%h)", rd_d);
         end
 
         // ---- Phase Z: cache bypass, stores.
-        // Z1 strobes all 8 bytes (the FSM skips the read-modify-write),
-        // Z2 strobes one byte of the upper word (it cannot: the controller
-        // drives dqm itself, so the word is read back, merged, rewritten).
+        // Z1 strobes all 4 bytes (the FSM skips the read-modify-write),
+        // Z2 strobes bytes 2-3 (it cannot mask them: the controller drives
+        // dqm itself, so the word is read back, merged, rewritten).
         // ----
-        d_access(a64(24'h60_0000), 1'b1, 64'h0011_2233_4455_6677, 8'hFF, rd_d, ok_d);
-        d_access(a64(24'h60_0000), 1'b0, '0, 8'h00, rd_d, ok_d);
-        if (!ok_d || rd_d !== 64'h0011_2233_4455_6677) begin
+        d_access(a32(24'h60_0000), 1'b1, 32'h4455_6677, 4'hF, rd_d, ok_d);
+        d_access(a32(24'h60_0000), 1'b0, '0, 4'h0, rd_d, ok_d);
+        if (!ok_d || rd_d !== 32'h4455_6677) begin
             error_count = error_count + 1;
             $display("FAIL  Z1: bypass full-word store round-trip (got %h)", rd_d);
         end else begin
             $display("PASS  Z1: bypass store round-tripped through the device (%h)", rd_d);
         end
 
-        d_access(a64(24'h60_0000), 1'b1, 64'h00EE_0000_0000_0000, 8'h40, rd_d, ok_d);
-        d_access(a64(24'h60_0000), 1'b0, '0, 8'h00, rd_d, ok_d);
-        if (!ok_d || rd_d !== 64'h00EE_2233_4455_6677) begin
+        d_access(a32(24'h60_0000), 1'b1, 32'h00EE_0000, 4'b1100, rd_d, ok_d);
+        d_access(a32(24'h60_0000), 1'b0, '0, 4'h0, rd_d, ok_d);
+        if (!ok_d || rd_d !== 32'h00EE_6677) begin
             error_count = error_count + 1;
-            $display("FAIL  Z2: bypass partial store merge (expected %h got %h)",
-                     64'h00EE_2233_4455_6677, rd_d);
+            $display("FAIL  Z2: bypass partial store merge (expected %h got %h)", 32'h00EE_6677,
+                     rd_d);
         end else begin
             $display("PASS  Z2: bypass partial store read-modify-wrote the word (%h)", rd_d);
         end
 
         // Bypass off again: the same address 0 must go back to answering
         // out of the (still dirty) cache line.
-        d_access(a64(24'h80_1000), 1'b1, 64'd0, 8'h01, rd_d, ok_d);
-        d_access(a64(24'h00_0000), 1'b0, '0, 8'h00, rd_d, ok_d);
+        d_access(a32(24'h80_1000), 1'b1, 32'd0, 4'h1, rd_d, ok_d);
+        d_access(a32(24'h00_0000), 1'b0, '0, 4'h0, rd_d, ok_d);
         if (!ok_d || rd_d !== EXP_PARTIAL) begin
             error_count = error_count + 1;
             $display("FAIL  Z3: cached load after clearing bypass (expected %h got %h)",
