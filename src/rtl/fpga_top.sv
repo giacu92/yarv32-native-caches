@@ -280,7 +280,7 @@ module fpga_top #(
     //             them left to right: the first one that stopped counting
     //             is the step that never happened.
     //   E = the D-port bits LIVE (same encoding as D)
-    //   W = the handshake the BIST sees: {wready, rvalid, req.valid, we}
+    //   W = the handshake the BIST sees: {wready, rvalid, req.wvalid, we}
     //   V = build id (BUILD_ID above): says which bitstream is running
     //   A = D-port accepts (control counter: the skid slot cannot be
     //       occupied with A at 0, so a zero there indicts the counters)

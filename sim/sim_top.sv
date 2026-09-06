@@ -420,7 +420,7 @@ module sim_top;
         // A is issued with rready=0: its response must be HELD in the
         // response queue, not lost. B (same line, next doubleword) is
         // issued while A is unconsumed — 2 outstanding reads, I-port only.
-        // Both responses must arrive in order (A first, then B), and wready
+        // Both responses must arrive in order (A first, then B), and ready
         // must drop once both units are in flight.
         // ----
         // (Historically ran before the miss phases because a miss wedged

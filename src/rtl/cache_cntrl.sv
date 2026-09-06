@@ -323,7 +323,8 @@ module cache_cntrl #(
     // hundreds of "range select out of bounds" warnings on dmem_req.
     localparam int SLOT_IDX_W = $clog2(N_SLOT);
 
-    logic [N_CACHE-1:0][SLOT_IDX_W-1:0] slot_free;  // first free slot (skid full only if !wready)
+    logic [N_CACHE-1:0][SLOT_IDX_W-1:0]
+        slot_free;  // first free slot (skid full only if accept low)
     logic [N_CACHE-1:0][SLOT_IDX_W-1:0] slot_lookup_sel;  // slot to launch the lookup for
     logic [N_CACHE-1:0][SLOT_IDX_W-1:0] slot_rsp_sel;  // slot the tag answer belongs to
     logic [N_CACHE-1:0][SLOT_IDX_W-1:0] slot_miss_sel;  // oldest slot the FSM will pick up
@@ -351,7 +352,7 @@ module cache_cntrl #(
     logic [N_CACHE-1:0][1:0] acc_tgt;  // target of the request being offered now
 
     // The uncached targets share one rule: a slot holding one is the only
-    // thing outstanding on its port (see the wready gating), so ordering
+    // thing outstanding on its port (see the accept gating), so ordering
     // against cached responses needs no extra machinery — there is nothing
     // to order against.
     logic [N_CACHE-1:0] nc_busy;  // this port holds an uncached slot
@@ -417,7 +418,7 @@ module cache_cntrl #(
         for (int c = 0; c < N_CACHE; c++) begin
             if (!skid_valid_q[c][0]) slot_free[c] = 0;
             else if (!skid_valid_q[c][1]) slot_free[c] = 1;
-            else slot_free[c] = 0;  // full: unreachable while wready=1
+            else slot_free[c] = 0;  // full: unreachable while accept high
 
             if (skid_valid_q[c][0] && !slot_lookup_q[c][0]) slot_lookup_sel[c] = 0;
             else if (skid_valid_q[c][1] && !slot_lookup_q[c][1]) slot_lookup_sel[c] = 1;
@@ -472,7 +473,7 @@ module cache_cntrl #(
     assign acc_tgt[0] = req_target(icache_req_i.addr, cache_bypass);
     assign acc_tgt[1] = req_target(dcache_req_i.addr, cache_bypass);
 
-    // The uncached slot of each port (at most one, by the wready gating).
+    // The uncached slot of each port (at most one, by the accept gating).
     always_comb begin
         for (int c = 0; c < N_CACHE; c++) begin
             nc_busy[c] = 1'b0;
@@ -589,7 +590,7 @@ module cache_cntrl #(
             // data/tag macros (fsm_lookup_gate): a lookup launch would
             // clobber the victim-line read held in the macro's rdata_q, or
             // race the line/tag commit. Lookups on the OTHER cache and
-            // accepts/wready are unaffected — hits-under-miss resume during
+            // accepts are unaffected — hits-under-miss resume during
             // the (long) refill states, which do not touch the macros.
             //
             // Only TGT_CACHE slots take this path: an uncached slot is
@@ -752,7 +753,7 @@ module cache_cntrl #(
     //
     // So: after reset, walk every set and write valid=0 into every way of
     // both caches (the four tag macros are independent, so one set per
-    // cycle covers all of them), and hold both ports' wready low until the
+    // cycle covers all of them), and hold both ports' accept low until the
     // sweep is done. N_SETS cycles, once, at reset.
     // ===================================================================
     logic [NBIT_SET_IDX:0] tag_init_cnt_q;
@@ -863,7 +864,7 @@ module cache_cntrl #(
         end
 
         // Invalidation sweep owns the tag macros until it is done. It runs
-        // before any request can be accepted (wready is low), so nothing
+        // before any request can be accepted (accept is low), so nothing
         // else is driving them here.
         if (!tag_init_done) begin
             for (int i = 0; i < N_WAY; i++) begin
@@ -1074,7 +1075,7 @@ module cache_cntrl #(
             end
         end else begin
             for (int c = 0; c < N_CACHE; c++) begin
-                // Accept: fill the first free slot (wready guarantees one).
+                // Accept: fill the first free slot (accept guarantees one).
                 // Whole-struct copies: the skid split keeps each port's
                 // request in its own typed array, so the copy stays a
                 // packed-vector assignment of the same expansion.
@@ -1809,7 +1810,7 @@ module cache_cntrl #(
     //   A queue entry pushed while an older miss was unresolved is blocked
     //   (rq_blk_q) until that miss completes — responses are delivered in
     //   accept order, which the fetch unit's instruction buffer relies on.
-    //   wready accepts while outstanding (occupied slots + unconsumed
+    //   The port accepts while outstanding (occupied slots + unconsumed
     //   entries) is below the per-port limit: 2 for the I-port's 2
     //   outstanding reads, 1 for the single-outstanding D-port. Hits are
     //   served while the miss FSM is mid-transit; only unresolved-miss
