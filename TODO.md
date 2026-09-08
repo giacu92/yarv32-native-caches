@@ -612,6 +612,102 @@ Open:
   alongside `dbg_state_o` before the next bring-up run (see Phase 6's
   fail-code notes).
 
+## Phase 12 — BSRAM budget: tag macros to LUT SSRAM — DONE (2026-09-08)
+
+GowinSynthesis reported 36 of the GW2AR-18's 46 BSRAM blocks for the cache
+alone, which leaves too little for the CPU it is being attached to. The
+count decomposes exactly, and the decomposition is what picked the fix: a
+Gowin BSRAM block holds 18 kb but tops out at a data width of 32, so an
+array pays one block per 32 bits of WIDTH before its depth counts for
+anything. The four 128 x 256 bit data macros are 8 blocks apiece = 32,
+using 128 of 512 words in each; the four 128 x 16 bit tag macros were a
+whole block each for 2048 bits, 11% of one = 4. 32 + 4 = 36.
+
+- [x] `native_ram` takes a `RAM_STYLE` parameter: `"block"` (default,
+  BSRAM) or `"distributed"` (LUT-based SSRAM). The four tag macros in
+  `cache_cntrl` are `"distributed"`; the data macros stay in BSRAM, being
+  far too wide for LUTs.
+- [x] Measured, not assumed: 36 → 32 in `make lint-yosys`, and 36 → 32
+  confirmed on the Gowin host. That is the first case where yosys and
+  GowinSynthesis agree on a block count, so `syn_ramstyle =
+  "distributed_ram"` is read rather than ignored — worth knowing, given
+  the two tools disagreed 36 vs 136 over `BYTE_WRITE`.
+- [x] Two mechanics the implementation is stuck with. A Verilog attribute
+  value must be a literal, so the two styles cannot share one array
+  declaration: they are two arrays in a conditional generate, with
+  everything that names the array coming from `NATIVE_RAM_*` macros
+  defined just above them, which is what keeps the branches from drifting.
+  And both arms of that generate are named `gen_store`, so the storage's
+  hierarchical path (`u_<inst>.gen_store.mem`) does not depend on the
+  style an instance picked — `sim_top`'s 17 macro preloads go through that
+  path and must not have to know.
+- [x] Verified: `make sim`, `make bist`, both with `+RAM_GARBAGE` and
+  under `--x-initial unique` (`xrun`/`xbist`), `make lint-yosys`,
+  `make format-check` — all green. Then the bitstream on silicon: the BIST
+  reports `F0 ... B7 ... S2` (pass, `S_DONE`, no fail code) with all four
+  D-cache event counters and the accept counter saturated.
+
+Open:
+
+- [ ] `make gatesim` not re-run: `iverilog` is not installed on this
+  machine (`sv2v` and `yosys` now are, contrary to CLAUDE.md's tooling
+  note). LUT SSRAM is the style whose power-up content a 4-state run would
+  have something to say about; the tag invalidation sweep covers it by
+  construction, and `+RAM_GARBAGE` passes, but the gate-level run is still
+  owed.
+- [x] `BUILD_ID` bumped to 14, with the missing log entry for 13 (the
+  Phase 11 FSM re-encoding) written in too. It had been left at 13 across
+  the LUT-SSRAM change, so the board printed `VD` both before and after
+  it — exactly the ambiguity the field exists to prevent.
+- [ ] The remaining 32 blocks are all width, not capacity: narrowing the
+  data macros from `DATA_WIDTH` 256 to 64 (depth 512) would take them from
+  32 blocks to 8. It is a miss-FSM rework — `S_UPDATE_TAG` and
+  `S_WB_READ` become multi-cycle, and `sdram_line_port`'s "caller holds
+  `cmd_wdata_i`" contract needs either a per-word wdata handshake or a
+  256-bit writeback buffer register. Also the likelier fix for the long
+  Gowin PnR times, which 4 blocks will not touch: the congestion suspect
+  is ten 256-bit buses feeding 32 BSRAMs through wide muxes.
+
+## Phase 13 — UART reports a verdict, not a dump — DONE (2026-09-08)
+
+The reporter printed all 18 hex fields every period regardless of outcome,
+so reading a passing board meant decoding 18 nibbles to learn one bit.
+
+- [x] `dbg_reporter` takes `pass_i`/`fail_i` and picks the line from them:
+  `"PASS"` on a pass, `"FAIL "` + all the fields on a failure, and nothing
+  at all while the test is busy. The verdict is latched with the fields at
+  line start, so a verdict that changes mid-line cannot re-length the line
+  under way, and `idx_q` parks on a sentinel above both lengths rather than
+  one past the end of the shorter one.
+- [x] Known cost, taken deliberately: a board that wedges WITHOUT tripping
+  a watchdog now says nothing, where the old unconditional line at least
+  proved the clock and the UART were alive. The watchdogs are what covers
+  that — a stuck port becomes `fail_i`, not silence — with the heartbeat
+  LED as the other half. `cache_bist`'s hang hold keeps the failing stage
+  asserted, so the fail line still describes the stall.
+- [x] `bist_tb` waits after the verdict (1500 clocks on a pass, 5000 on a
+  failure) so the line lands inside the run; with no line printed while
+  busy, that wait is now the only thing proving the framing in simulation.
+- [x] Verified both directions, not just the easy one: `make bist` prints
+  `PASS` and nothing else. Injecting a mismatch into `test_expect` prints
+  `FAIL F1 G4 C0 D5 B7 I3 S1 LF PF MF UF E4 W8 VE AF K1 R0 T0` — fail code
+  1 (data), failure stage 4 (`S_LOAD_RSP`), `S1` = fail. Mutation reverted.
+
+Open:
+
+- [ ] The `T` field is dead on the board and always was, for a reason the
+  code comment gets wrong. The reporter starts a line when its
+  `PERIOD_W`-wide counter reads all ones, so samples sit exactly
+  `2**PERIOD_W` clocks apart and EVERY `tick_q` bit below index `PERIOD_W`
+  is sampled at the same phase every line. `dbg_tick_o = {tick_q[20],
+  tick_q[17], tick_q[14], tick_q[11]}` is entirely below 24, so it is
+  constant by construction; `cache_cntrl.sv:1384`'s rule ("NOT a multiple
+  of the reporter's period") is not the condition. The condition is bit
+  index >= `PERIOD_W`, which only `dbg_hb_o = tick_q[24]` meets. It reads
+  live in simulation because `bist_tb` sets `UART_PERIOD_W=9`. Fix by
+  exporting `tick_q[27:24]`. This is the same probe-aliasing class that
+  CLAUDE.md records costing three board round-trips.
+
 ## Phase 7 — Verification hardening
 
 - [ ] Test through the CPU-facing interface instead of hierarchical taps:

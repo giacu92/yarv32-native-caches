@@ -105,7 +105,11 @@ module fpga_top #(
     //  11 = single external reset, registered, no POR counter / lock gate
     //  12 = yarv32-uc CPU interface: 64-bit read-only I port (ifetch_*),
     //       32-bit byte-strobed D port (mem_*)
-    localparam logic [3:0] BUILD_ID = 4'd13;
+    //  13 = SDRAM per-word handshakes moved into sdram_line_port (the
+    //       miss FSM's state encoding, and so dbg_state_o, changed)
+    //  14 = tag macros in LUT SSRAM (36 -> 32 BSRAM blocks); the UART
+    //       reports a verdict only ("PASS", or "FAIL" + the fields)
+    localparam logic [3:0] BUILD_ID = 4'd14;
 
     // -------------------------------------------------------------------
     // Clock generation
@@ -327,6 +331,8 @@ module fpga_top #(
             bist_fail_stage,
             {2'b00, bist_fail_code}
         }),
+        .pass_i(bist_pass),
+        .fail_i(bist_fail),
         .tx_valid_o(tx_valid),
         .tx_ready_i(tx_ready),
         .tx_data_o(tx_data)

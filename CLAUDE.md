@@ -70,8 +70,10 @@ not installed on this machine.
   count with or without `BYTE_WRITE`, while GowinSynthesis needed 136 for
   the byte-writable version. Over the limit means a real problem; under it
   is necessary, not sufficient. It does track `RAM_STYLE`, though: moving
-  the four tag macros to LUT SSRAM took the count from 36 to 32, matching
-  the block accounting below. Known noise (translation artifacts, not
+  the four tag macros to LUT SSRAM took the count from 36 to 32, and
+  GowinSynthesis reported the same 32 — the one case so far where the two
+  tools agree, so `syn_ramstyle = "distributed_ram"` is confirmed to be
+  read rather than ignored. Known noise (translation artifacts, not
   defects): sv2v renders `parameter type` ports at their default width
   before yosys specializes them (out-of-bounds range-select warnings on
   `mem_req_i`), and turns an `always_comb` loop variable into a block reg
@@ -174,7 +176,8 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   using 128 of 512 available words in each — and the four 128 x 16 bit tag
   macros were the other 4, a full block each for 2048 bits, 11% of one.
   The tag macros are therefore `RAM_STYLE("distributed")` and the data
-  macros stay in BSRAM (too wide for LUTs); the count went 36 to 32.
+  macros stay in BSRAM (too wide for LUTs); the count went 36 to 32 in
+  yosys and, confirmed on the Gowin host, 36 to 32 in GowinSynthesis.
   Neither style resets its contents, so the tag invalidation sweep is
   needed either way.
   Two mechanics worth knowing before touching this. A Verilog attribute
@@ -251,38 +254,64 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   reporting knob: it sets the SDRAM refresh spacing.
 - `src/rtl/dbg_uart_tx.sv`, `src/rtl/dbg_reporter.sv` — bring-up console:
   an 8N1 transmit-only UART (115200 on the board, into the onboard BL616
-  USB bridge on PIN69) and a reporter that prints one status line per
-  period, `"F0 G0 C0 D0 B1 I3 S4 L4 P4 M4 U3"` — fail code, BIST stage AT the failure,
-  cache miss-FSM state at the failure, cache D-port bits at the failure,
-  then the live BIST stage, live vector index, and `{0, busy, pass, fail}`.
-  The live pair says where a running board is; the latched trio says where
-  a failed one stopped, which the live pair cannot (by the time anyone
-  reads it the stage is `S_DONE`). The last field, `V`, is `fpga_top`'s
-  `BUILD_ID`: BUMP IT with every bitstream that changes behaviour, or two
-  builds print identical lines and the board cannot say which fix is
-  actually running. `A K R` are the accept counter and the live taps on
-  the lookup-issue and macro-answer paths — `A` exists as a CONTROL: the
-  skid slot cannot be occupied without an accept, so `A0` accuses the
-  counter path itself rather than the design. Fields are sampled once at line start,
-  so a line is one instant rather than a mix of several. `L P M U` are the
-  D-cache event counters (`cache_cntrl.dbg_cnt_o`, saturating at F) in the
-  order a request passes through them — lookups launched, tag answers seen,
-  misses picked up by the FSM, misses unstalled: the first count that
-  stopped advancing is the step that never happened, which a final-state
-  snapshot cannot tell you. `E` repeats the D-port bits live and `W` is the
-  handshake the BIST master sees (`{wready, rvalid, req.wvalid, we}`). On a
-  watchdog failure the BIST does NOT return to `S_DONE`: it HOLDS the stage
-  that hung, keeping its request asserted, so the live fields describe the
-  stall instead of the recovery from it — without that hold, a latched
-  "lookup launched" could sit next to a live lookup count of zero, two
-  truths about two different instants. The LEDs carry a verdict; the
-  UART is what carries several fields at once, which is what a hang needs.
+  USB bridge on PIN69) and a reporter that prints one VERDICT line per
+  period. What the line says depends on the verdict, and the asymmetry is
+  the point:
+  - passing: `"PASS"`, nothing else. A board that works has nothing to say
+    beyond that it works, and 18 hex fields to read every time it does is
+    18 chances to misread one.
+  - failing: `"FAIL "` followed by the whole debug log, one labelled hex
+    nibble per field: `FAIL F0 G0 C0 D0 B1 I3 S4 L4 P4 M4 U3 E4 W8 VE AF
+    K1 R0 T0`. A failing board is the opposite case — the fields are the
+    only console there is, they cannot be recovered later, and the BIST
+    HOLDS the failing stage (see `cache_bist`'s hang hold), so the line
+    describes the stall rather than the recovery from it.
+  - running: nothing at all, the line is suppressed. The cost is that a
+    board which wedges WITHOUT tripping a watchdog now says nothing, where
+    an unconditional line at least proved the clock and the UART were
+    alive; the watchdogs are what covers that (a stuck port becomes a
+    fail, not silence), with the heartbeat LED as the other half.
+  The fail line's fields, in order: `F` fail code, `G` BIST stage AT the
+  failure, `C` cache miss-FSM state at the failure, `D` cache D-port bits
+  at the failure, then the live `B` BIST stage and `I` vector index, and
+  `S` = `{0, busy, pass, fail}`. The live pair says where a running board
+  is; the latched trio says where a failed one stopped, which the live pair
+  cannot (by the time anyone reads it the stage is held, but on a data
+  mismatch it is `S_DONE`). `L P M U` are the D-cache event counters
+  (`cache_cntrl.dbg_cnt_o`, saturating at F) in the order a request passes
+  through them — lookups launched, tag answers seen, misses picked up by
+  the FSM, misses unstalled: the first count that stopped advancing is the
+  step that never happened, which a final-state snapshot cannot tell you.
+  `E` repeats the D-port bits live and `W` is the handshake the BIST master
+  sees (`{wready, rvalid, req.wvalid, we}`). `A K R` are the accept counter
+  and the live taps on the lookup-issue and macro-answer paths — `A` exists
+  as a CONTROL: the skid slot cannot be occupied without an accept, so `A0`
+  accuses the counter path itself rather than the design. `V` is
+  `fpga_top`'s `BUILD_ID`: BUMP IT with every bitstream that changes
+  behaviour, or two builds print identical lines and the board cannot say
+  which fix is actually running. Fields are sampled once at line start, so
+  a line is one instant rather than a mix of several.
+  `T` is the free-running tick probe and it is BROKEN on the board, still:
+  the reporter starts a line when its `PERIOD_W`-wide counter is all ones,
+  so samples are exactly `2**PERIOD_W` clocks apart and every `tick_q` bit
+  BELOW index `PERIOD_W` reads the same phase every line.
+  `dbg_tick_o = {tick_q[20], tick_q[17], tick_q[14], tick_q[11]}` is
+  entirely below 24, so it is constant by construction — which is exactly
+  the aliasing the comment at `cache_cntrl.sv:1384` claims to have fixed,
+  and its stated rule ("not a multiple of the reporter's period") is the
+  wrong rule. The condition is bit index >= `PERIOD_W`; `dbg_hb_o =
+  tick_q[24]` is the only tick export that meets it. It reads live in
+  simulation only because `bist_tb` sets `UART_PERIOD_W=9`. Fix by
+  exporting `tick_q[27:24]`.
   `fpga_top`'s `UART_BAUD` / `UART_PERIOD_W` parameters exist so the
   testbench can speed both up and read whole lines in a short run.
 - `sim/bist_tb.sv` — testbench for `fpga_top` + `cache_bist` against
   `sdram_model` (`make bist`). Fails on a mismatch or on its own timeout,
-  and decodes the debug UART so simulation prints the same status lines the
-  board sends — the framing is proven before anything is flashed.
+  and decodes the debug UART so simulation prints the same verdict line the
+  board sends — the framing is proven before anything is flashed. Since the
+  reporter stays silent while the test is busy, the run now waits after the
+  verdict (1500 clocks on a pass, 5000 on a failure) so that line actually
+  lands inside the simulation.
 - `sim/sim_top.sv` — Verilator testbench / sim top (clock, reset, drives
   the I/D-cache ports with the yarv32-uc types, dumps `sim_top.vcd`).
   Compiles with `--timing`. Self-checking phases with PASS/FAIL counters,

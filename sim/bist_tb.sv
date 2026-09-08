@@ -130,14 +130,17 @@ module bist_tb;
                 fail_state
             );
 
-        // On a failure, give the reporter time to emit a full status line
-        // first: the BIST holds the stalled request (hang hold), so that
-        // line is the post-mortem, and killing the run before it prints
-        // would throw away the only evidence.
-        // Long enough for a line that STARTED after the failure: the
-        // reporter samples its fields at line start, so a shorter wait
-        // catches the line already in flight, which predates the failure.
-        repeat (bist_fail ? 5000 : 10) @(posedge clk);
+        // Give the reporter time to emit its verdict line before the run
+        // ends. It prints nothing while the test is busy, so on EITHER
+        // outcome the only line that ever appears starts after the verdict
+        // does — which is also what proves the framing here before
+        // anything is flashed.
+        // On a failure the wait is longer: the BIST holds the stalled
+        // request (hang hold), the fail line carries all the fields, and
+        // killing the run before it prints would throw away the only
+        // evidence. On a pass, one period (512 clocks) plus a 6-byte line
+        // at 4 clocks/bit is ~760 clocks.
+        repeat (bist_fail ? 5000 : 1500) @(posedge clk);
         if (bist_fail || u_sdram.protocol_errors != 0) $fatal(1, "[bist_tb] BIST FAILED");
         $finish;
     end
