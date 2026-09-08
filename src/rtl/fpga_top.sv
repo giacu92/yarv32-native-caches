@@ -105,7 +105,7 @@ module fpga_top #(
     //  11 = single external reset, registered, no POR counter / lock gate
     //  12 = yarv32-uc CPU interface: 64-bit read-only I port (ifetch_*),
     //       32-bit byte-strobed D port (mem_*)
-    localparam logic [3:0] BUILD_ID = 4'd12;
+    localparam logic [3:0] BUILD_ID = 4'd13;
 
     // -------------------------------------------------------------------
     // Clock generation

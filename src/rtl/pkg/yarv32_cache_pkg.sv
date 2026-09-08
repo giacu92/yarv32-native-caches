@@ -59,20 +59,15 @@ package yarv32_cache_pkg;
     localparam int unsigned LSU_DATA_W = 32;
     localparam int unsigned LSU_STRB_W = LSU_DATA_W / 8;
 
-    // Cache-line variant: one whole cache line per RAM word (2^5 = 32 B
-    // at CL_SIZE=5). Must stay consistent with cache_cntrl's
-    // DATA_WIDTH = 2**(CL_SIZE+3).
-    localparam int unsigned CACHE_WIDTH = 256;
-    localparam int unsigned CACHE_STRB_WIDTH = CACHE_WIDTH / 8;
-
-    // Legacy macro-pair width constants: the line-width pair below and
-    // the internal line/tag macro expansions in cache_cntrl still use
-    // them (64-bit data words there, not the CPU widths).
-    localparam int unsigned MEM_WIDTH = 64;
-    localparam int unsigned STRB_WIDTH = MEM_WIDTH / 8;
-
-    // Native protocol, cache-line width: cache data macros.
-    `YARV_MEM_TYPES(cache_req_t, cache_rsp_t, NATIVE_ADDR_W, CACHE_WIDTH)
+    // No fixed-width cache-line pair lives here on purpose: cache_cntrl
+    // re-expands `YARV_MEM_TYPES at its own DATA_WIDTH (line) and
+    // TAG_DATA_W (tag), so those pairs track the geometry parameters
+    // instead of a constant that can drift away from them. The removed
+    // MEM_WIDTH / STRB_WIDTH / cache_req_t / cache_rsp_t were unused and
+    // were a trap for a new port: a struct-to-struct connection is a
+    // packed-vector copy, so a pair sized from the wrong constant
+    // connects without a type error (native_ram now pins its own port
+    // widths, but a port pair on any other module still would not).
 
     // Bootrom protocol: same macro shape, but 32-bit byte address. The
     // bootrom macro stays 64-bit data (the I port fetches 8 bytes), so

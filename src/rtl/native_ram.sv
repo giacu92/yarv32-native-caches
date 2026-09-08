@@ -79,11 +79,16 @@ module native_ram #(
     parameter string INIT_FILE = "",
     // Native-protocol struct pair, normally built with the
     // `YARV_MEM_TYPES macro at (REQ_ADDR_W, DATA_WIDTH). Defaults are the
-    // bootrom pair (64-bit data, the widest fixed user). Width safety is
-    // enforced by the elaboration checks below (a mismatched REQ_T/RSP_T
-    // is caught, not silently truncated).
+    // bootrom pair (64-bit data, the widest fixed user). The elaboration
+    // checks below pin all four widths that appear on the port -- addr,
+    // wdata, wstrb, rdata -- so a pair built at the wrong geometry fails
+    // to elaborate instead of connecting silently.
     parameter type REQ_T = yarv32_cache_pkg::boot_req_t,
-    parameter type RSP_T = yarv32_cache_pkg::boot_rsp_t
+    parameter type RSP_T = yarv32_cache_pkg::boot_rsp_t,
+    // Storage implementation: "block" = BSRAM, "distributed" = LUT-based
+    // SSRAM. Like BYTE_WRITE this is a RESOURCE decision, not a
+    // functional one; see the storage section below.
+    parameter string RAM_STYLE = "block"
 ) (
     input wire clk_i,
     input wire rstn_i,
@@ -123,60 +128,21 @@ module native_ram #(
             $fatal(
                 1, "rsp.rdata width (%0d) != DATA_WIDTH (%0d)", $bits(mem_rsp_o.rdata), DATA_WIDTH
             );
+        // The addr field is the one width nothing else would catch: a
+        // wider addr still connects (packed-vector copy) and the extra
+        // MSBs are simply never sampled, so a pair built at the wrong
+        // ADDR_W would read as a silently working RAM.
+        assert ($bits(mem_req_i.addr) == REQ_ADDR_W)
+        else
+            $fatal(
+                1, "req.addr width (%0d) != REQ_ADDR_W (%0d)", $bits(mem_req_i.addr), REQ_ADDR_W
+            );
+        // An unrecognised RAM_STYLE would silently fall through to the
+        // BSRAM branch below, i.e. cost blocks the caller asked not to
+        // spend. Fail elaboration instead.
+        assert (RAM_STYLE == "block" || RAM_STYLE == "distributed")
+        else $fatal(1, "unknown RAM_STYLE \"%s\" (expected block|distributed)", RAM_STYLE);
     end
-`endif
-
-    // -----------------------------------------------------------------
-    // Storage (BSRAM)
-    // -----------------------------------------------------------------
-    // ram_style is the Vivado/Xilinx spelling; GowinSynthesis reads
-    // syn_ramstyle / syn_romstyle, so the first attribute alone was a no-op
-    // there. syn_noprune keeps the tool from folding the array away.
-    //
-    // None of these fix a depth reduction on their own: an uninitialised
-    // word is a constant, so GowinSynthesis is entitled to build a
-    // read-only array only as deep as its $readmemh content and let the
-    // upper address bits alias. Padding the image with a real instruction
-    // word (see the firmware Makefiles' IMEM_PAD_VALUE) is what actually
-    // pins the depth; these attributes only keep the implementation style
-    // predictable.
-    (* ram_style = "block" *)
-    (* syn_ramstyle = "block_ram" *)
-    (* syn_romstyle = "block_rom" *)
-    (* syn_noprune = 1 *)
-    logic [DATA_W-1:0] mem[DEPTH_WORDS];
-
-    initial begin
-        if (INIT_FILE != "") begin
-            $readmemh(INIT_FILE, mem);
-        end
-    end
-
-`ifdef VERILATOR
-`ifndef NO_SIM_PLUSARGS
-    // +RAM_GARBAGE fills the array with junk before time 0. Simulation
-    // otherwise hands out zeros for memory nobody wrote, which is how a
-    // design that trusts its RAM's power-up state passes here and hangs on
-    // a device — the cache's tag valid bits were exactly that bug. A test
-    // that passes with this plusarg does not depend on the accident.
-    // NO_SIM_PLUSARGS excludes this block from the sv2v/yosys paths
-    // (`make lint-yosys`, `make gatesim`): they preprocess with
-    // -DVERILATOR to bypass the rPLL, and yosys cannot read either the
-    // $test$plusargs call or sv2v's rendering of a size cast. The random
-    // value goes through a sized variable for the same reason.
-    logic [31:0] garbage_rnd;
-
-    initial begin
-        if ($test$plusargs("RAM_GARBAGE") && INIT_FILE == "") begin
-            for (int gi = 0; gi < DEPTH_WORDS; gi++) begin
-                for (int gb = 0; gb < DATA_W; gb++) begin
-                    garbage_rnd = $random();
-                    mem[gi][gb] = garbage_rnd[0];
-                end
-            end
-        end
-    end
-`endif
 `endif
 
     // -----------------------------------------------------------------
@@ -213,50 +179,156 @@ module native_ram #(
     // being drained).
     wire rsp_done = rvalid_q & mem_req_i.rready & ~launch_read;
 
-    always_ff @(posedge clk_i) begin
-        if (!rstn_i) begin
-            rvalid_q <= 1'b0;
-            rdata_q  <= '0;
-        end else begin
-            if (launch_read) begin
-                // Launch the BSRAM read; data registered, rvalid next
-                // cycle. Held until rready (rsp_done below clears it).
-                rvalid_q <= 1'b1;
-                rdata_q  <= mem[word_addr];
-            end else if (rsp_done) begin
-                rvalid_q <= 1'b0;
-            end
-        end
+    // The read launch itself (rdata_q <= mem[word_addr]) lives in the
+    // `NATIVE_RAM_READ macro below, next to the array it reads: the
+    // storage is declared per RAM_STYLE, so anything naming it has to be
+    // per RAM_STYLE too.
+
+    // -----------------------------------------------------------------
+    // Storage access, shared by both RAM_STYLE branches
+    // -----------------------------------------------------------------
+    // A Verilog attribute value must be a literal — it cannot be driven
+    // from a parameter — so the two storage styles below have to be two
+    // separate array declarations, which means two copies of everything
+    // that touches the array. These macros are that "everything": the
+    // branches instantiate the same text, so the styles cannot drift into
+    // behaving differently. (Same shape of workaround as the package's
+    // `YARV_MEM_TYPES: the language will not parameterize the thing that
+    // needs parameterizing.)
+    //
+    // Both arms of the conditional generate below are named gen_store, so
+    // the storage's hierarchical path (u_<inst>.gen_store.mem) does not
+    // depend on which style the instance chose — the testbenches preload
+    // these macros by hierarchical reference and must not have to know.
+    //
+    // The Verilator-only blocks are not in the macros because a compiler
+    // directive inside a macro body is not portable; their `ifdef guards
+    // sit around the invocations instead.
+    `define NATIVE_RAM_INIT(m) \
+    initial begin \
+        if (INIT_FILE != "") begin \
+            $readmemh(INIT_FILE, m); \
+        end \
+    end
+
+    `define NATIVE_RAM_GARBAGE(m) \
+    logic [31:0] garbage_rnd; \
+    initial begin \
+        if ($test$plusargs("RAM_GARBAGE") && INIT_FILE == "") begin \
+            for (int gi = 0; gi < DEPTH_WORDS; gi++) begin \
+                for (int gb = 0; gb < DATA_W; gb++) begin \
+                    garbage_rnd = $random(); \
+                    m[gi][gb]   = garbage_rnd[0]; \
+                end \
+            end \
+        end \
+    end
+
+    `define NATIVE_RAM_READ(m) \
+    always_ff @(posedge clk_i) begin \
+        if (!rstn_i) begin \
+            rvalid_q <= 1'b0; \
+            rdata_q  <= '0; \
+        end else begin \
+            if (launch_read) begin \
+                rvalid_q <= 1'b1; \
+                rdata_q  <= m[word_addr]; \
+            end else if (rsp_done) begin \
+                rvalid_q <= 1'b0; \
+            end \
+        end \
+    end
+
+    `define NATIVE_RAM_WRITE(m) \
+    if (!READ_ONLY && BYTE_WRITE) begin : gen_write \
+        always_ff @(posedge clk_i) begin \
+            if (launch_write) begin \
+                for (integer i = 0; i < STRB_W; i++) begin \
+                    if (mem_req_i.wstrb[i]) begin \
+                        m[word_addr][8*i+:8] <= mem_req_i.wdata[8*i+:8]; \
+                    end \
+                end \
+            end \
+        end \
+    end else if (!READ_ONLY) begin : gen_write_word \
+        always_ff @(posedge clk_i) begin \
+            if (launch_write) begin \
+                m[word_addr] <= mem_req_i.wdata; \
+            end \
+        end \
     end
 
     // -----------------------------------------------------------------
-    // Write path (D-mem only). Commits at the accept cycle: the
-    // byte-strobed BSRAM write fires the same clock edge as launch_hs,
-    // so a posted store retires and the data lands together. READ_ONLY
-    // gates it off entirely (I-mem never writes).
+    // Storage
     // -----------------------------------------------------------------
+    // RAM_STYLE is a RESOURCE parameter, like BYTE_WRITE. Gowin BSRAM is
+    // an 18 kb block with a maximum data width of 32, so a small array
+    // pays a whole block however few bits it holds — and a wider word
+    // pays one block per 32 bits of width before depth is considered at
+    // all. cache_cntrl's four 128 x 16 bit tag arrays therefore cost 4 of
+    // the design's 36 blocks to hold 2048 bits each, 11% of one block;
+    // its four 128 x 256 bit line arrays cost the other 32, 8 apiece for
+    // width alone. "distributed" puts an array in LUT-based SSRAM
+    // instead, which does not compete for the GW2AR-18's 46 blocks.
+    //
+    // Neither style resets its contents (BSRAM has no clear, and SSRAM
+    // comes up at whatever the bitstream loaded), so a master that cannot
+    // trust its storage at power-up must still clear it itself — see
+    // cache_cntrl's tag invalidation sweep. Simulation preloads via
+    // INIT_FILE, or fills with junk under +RAM_GARBAGE.
     generate
-        if (!READ_ONLY && BYTE_WRITE) begin : gen_write
-            always_ff @(posedge clk_i) begin
-                if (launch_write) begin
-                    for (integer i = 0; i < STRB_W; i++) begin
-                        if (mem_req_i.wstrb[i]) begin
-                            mem[word_addr][8*i+:8] <= mem_req_i.wdata[8*i+:8];
-                        end
-                    end
-                end
-            end
-        end else if (!READ_ONLY) begin : gen_write_word
-            // Whole-word write: one BSRAM write enable, no byte lanes.
-            always_ff @(posedge clk_i) begin
-                if (launch_write) begin
-                    mem[word_addr] <= mem_req_i.wdata;
-                end
-            end
+        if (RAM_STYLE == "distributed") begin : gen_store
+            (* ram_style = "distributed" *) (* syn_ramstyle = "distributed_ram" *)
+                (* syn_noprune = 1 *)
+            logic [DATA_W-1:0] mem[DEPTH_WORDS];
+
+            `NATIVE_RAM_INIT(mem)
+`ifdef VERILATOR
+`ifndef NO_SIM_PLUSARGS
+            `NATIVE_RAM_GARBAGE(mem)
+`endif
+`endif
+            `NATIVE_RAM_READ(mem)
+            `NATIVE_RAM_WRITE(mem)
+
+        end else begin : gen_store
+            // ram_style is the Vivado/Xilinx spelling; GowinSynthesis reads
+            // syn_ramstyle / syn_romstyle, so the first attribute alone was a
+            // no-op there. syn_noprune keeps the tool from folding the array
+            // away.
+            //
+            // None of these fix a depth reduction on their own: an
+            // uninitialised word is a constant, so GowinSynthesis is entitled
+            // to build a read-only array only as deep as its $readmemh
+            // content and let the upper address bits alias. Padding the image
+            // with a real instruction word (see the firmware Makefiles'
+            // IMEM_PAD_VALUE) is what actually pins the depth; these
+            // attributes only keep the implementation style predictable.
+            (* ram_style = "block" *)
+            (* syn_ramstyle = "block_ram" *)
+            (* syn_romstyle = "block_rom" *)
+            (* syn_noprune = 1 *)
+            logic [DATA_W-1:0] mem[DEPTH_WORDS];
+
+            `NATIVE_RAM_INIT(mem)
+`ifdef VERILATOR
+`ifndef NO_SIM_PLUSARGS
+            `NATIVE_RAM_GARBAGE(mem)
+`endif
+`endif
+            `NATIVE_RAM_READ(mem)
+            `NATIVE_RAM_WRITE(mem)
+
+        end
+    endgenerate
 
 `ifdef VERILATOR
-            // A partial strobe here would silently commit the unstrobed
-            // bytes too, which is exactly the bug BYTE_WRITE=0 invites.
+    // A partial strobe with BYTE_WRITE=0 would silently commit the
+    // unstrobed bytes too, which is exactly the bug that parameter
+    // invites. Outside the storage generate: it reads the request, not the
+    // array, so it needs no per-style copy.
+    generate
+        if (!READ_ONLY && !BYTE_WRITE) begin : gen_wstrb_chk
             always_ff @(posedge clk_i) begin
                 if (launch_write) begin
                     assert (&mem_req_i.wstrb)
@@ -266,9 +338,14 @@ module native_ram #(
                         );
                 end
             end
-`endif
         end
     endgenerate
+`endif
+
+    `undef NATIVE_RAM_INIT
+    `undef NATIVE_RAM_GARBAGE
+    `undef NATIVE_RAM_READ
+    `undef NATIVE_RAM_WRITE
 
 endmodule
 

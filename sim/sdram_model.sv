@@ -100,7 +100,7 @@ module sdram_model (
     logic mrs_done_q;
     time last_pall_time, last_ref_time, last_act_time[4];
 
-    localparam time T_RP  = 20ns;  // PRECHARGE -> next command to that bank
+    localparam time T_RP = 20ns;  // PRECHARGE -> next command to that bank
     localparam time T_RFC = 66ns;  // REFRESH -> next command
     localparam time T_RCD = 18ns;  // ACTIVATE -> READ/WRITE on that bank
 

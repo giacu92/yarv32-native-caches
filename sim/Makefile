@@ -23,7 +23,8 @@ VCD       := sim_top.vcd
 # and the testbench. The controller is real RTL driven on the raw SDRAM
 # pins, so the sim exercises the actual command encoding end-to-end.
 RTL_PKG   := ../src/rtl/pkg/yarv32_cache_pkg.sv
-RTL       := ../src/rtl/native_ram.sv ../src/rtl/cache_cntrl.sv \
+RTL       := ../src/rtl/native_ram.sv ../src/rtl/sdram_line_port.sv \
+             ../src/rtl/cache_cntrl.sv \
              ../src/ips/sdram-controller/rtl/sdram_controller.v
 SIM_RTL   := sdram_model.sv sim_top.sv
 
@@ -39,15 +40,17 @@ BIST_VCD  := bist_tb.vcd
 
 # --timing: enable # delays / event waits in the testbench.
 # --trace : enable $dumpfile/$dumpvars VCD output.
-# Warnings silenced: unused signals (skeleton FSM TODO gaps), incomplete
-# case, combinational-loop false-positives on the struct-array tag path,
-# and the initial-block-for-clocks pattern. Width truncation/expansion are
-# NOT silenced any more: the parametrizable mem/cache/tag struct pair
-# (yarv32_cache_pkg macros) keeps port widths matched by construction, so
-# a width warning now means a real bug.
-VFLAGS    := --binary --timing --trace \
-             -Wno-UNUSED -Wno-CASEINCOMPLETE \
-             -Wno-UNOPTFLAT -Wno-INITIALDLY -Wno-MULTIDRIVEN
+#
+# NO warning waivers. There used to be five (-Wno-UNUSED,
+# -Wno-CASEINCOMPLETE, -Wno-UNOPTFLAT, -Wno-INITIALDLY, -Wno-MULTIDRIVEN),
+# left over from the skeleton-FSM days; by 2026-09-08 every one of them
+# suppressed nothing -- both sims build clean with none. They are gone
+# rather than kept "just in case", because a waiver's whole cost is what
+# it hides on the day it starts mattering again: -Wno-UNUSED is what hid
+# the dead dcache_line, and -Wno-WIDTH hid mismatched struct pairs until
+# it was dropped too. Adding one back means writing down here which
+# specific construct needs it and why the warning is wrong.
+VFLAGS    := --binary --timing --trace
 
 # X-initial variants: Verilator reads uninitialised state as zero, which is
 # exactly how a missing reset hides. --x-initial unique gives every
@@ -93,8 +96,7 @@ xbist:
 # for the board build on a machine without the Gowin toolchain (the rPLL
 # hard macro is bypassed under `VERILATOR`).
 lint-fpga:
-	$(VERILATOR) --lint-only -Wno-UNUSED -Wno-CASEINCOMPLETE -Wno-UNOPTFLAT \
-	    -Wno-MULTIDRIVEN --top-module fpga_top $(RTL_PKG) $(RTL) $(FPGA_RTL)
+	$(VERILATOR) --lint-only --top-module fpga_top $(RTL_PKG) $(RTL) $(FPGA_RTL)
 
 clean:
 	rm -rf obj_dir obj_bist obj_xdir obj_xbist $(VCD) $(BIST_VCD)

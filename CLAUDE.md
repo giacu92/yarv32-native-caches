@@ -18,6 +18,10 @@ not installed on this machine.
   `verible-verilog-format` (policy in `verible.flags`: 4-space indent,
   100-col limit, aligned ports/params/connections/assignments).
 - `make format-check` — exit 1 if any file is unformatted (CI / pre-commit).
+  Run `make format` BEFORE committing: this gate was red for three commits
+  because hand-aligned `localparam` groups were committed without it, and
+  verible reformats those groups flush under every alignment mode the
+  flagfile offers. Do not hand-align declarations.
 - `make format-diff` — print a unified diff of pending formatting changes.
 - `make sim` / `make run` — build + run the Verilator sim (delegates to
   `sim/Makefile`; requires `verilator`).
@@ -62,10 +66,12 @@ not installed on this machine.
   (`scripts/yosys_check.sh`): fails on undriven nets (the Gowin `EX1998`
   class) and reports a BSRAM count against the GW2AR-18's 46 blocks
   (`RP0002`). Its block count is an estimate of what the DESIGN needs, not
-  a prediction of GowinSynthesis's mapping — yosys reports the same 36
-  blocks with or without `BYTE_WRITE`, while GowinSynthesis needed 136 for
+  a prediction of GowinSynthesis's mapping — yosys reports the same block
+  count with or without `BYTE_WRITE`, while GowinSynthesis needed 136 for
   the byte-writable version. Over the limit means a real problem; under it
-  is necessary, not sufficient. Known noise (translation artifacts, not
+  is necessary, not sufficient. It does track `RAM_STYLE`, though: moving
+  the four tag macros to LUT SSRAM took the count from 36 to 32, matching
+  the block accounting below. Known noise (translation artifacts, not
   defects): sv2v renders `parameter type` ports at their default width
   before yosys specializes them (out-of-bounds range-select warnings on
   `mem_req_i`), and turns an `always_comb` loop variable into a block reg
@@ -95,38 +101,59 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   the native `mem_req_t`/`mem_rsp_t` protocol (see below). Parametrized by
   `ADDR_W`, `DATA_WIDTH`, `READ_ONLY`. Used for bootrom, cache data
   macros, and tag macros.
+- `src/rtl/sdram_line_port.sv` — SDRAM word-streaming engine, sitting
+  between the miss FSM and the `sdram_controller` submodule. It turns the
+  controller's one-word-per-transaction host interface into a "move N
+  consecutive words" command, so every per-word handshake rule — hold the
+  enable until `busy` rises because a due refresh may delay the accept,
+  end a write on the `busy` fall, capture a read on the `rd_ready` pulse —
+  lives in one place. A command is accepted on `cmd_valid_i &&
+  cmd_ready_o`; `done_o` pulses for one cycle as the last word completes,
+  while `cmd_ready_o` is still low, so a caller may drive `cmd_valid_i =
+  cmd_ready_o` and cannot re-issue the command it just saw finish. Write
+  data is NOT registered (that would be a whole line of flops for
+  nothing): the caller holds `cmd_wdata_i` until `done_o` — the cache's
+  writeback source is the data macro's registered output, held for exactly
+  that window by the lookup gate. Read words accumulate into `rdata_o` and
+  HOLD there, so a short read leaves the upper words at whatever the
+  previous command left; a caller reads back only the words it asked for.
+  Costs one cycle per COMMAND (four per miss at worst), not per word.
 - `src/rtl/pkg/yarv32_cache_pkg.sv` — the protocol types.
   SystemVerilog packages cannot parameterize typedefs, so the
   `` `YARV_MEM_TYPES``/`` `YARV_MEM_REQ_T``/`` `YARV_MEM_RSP_T`` macros build
   the req/rsp pair per (ADDR_W, DATA_W) with fixed field order/semantics;
-  the package instantiates `boot_req_t`/`boot_rsp_t` (64-bit data, the
-  bootrom macro and `native_ram`'s parameter defaults) and `cache_req_t`/
-  `cache_rsp_t` (256-bit line width) from them. The two CPU-facing pairs
-  are NOT macro-built — the ports have different field sets, so they are
-  hand-declared bit-identical to the yarv32-uc core's `rv32_pkg`
-  typedefs: `ifetch_req_t`/`ifetch_rsp_t` ($bits 34/66) and the 32-bit
-  `mem_req_t`/`mem_rsp_t` ($bits 71/35; note `mem_req_t` is now the
-  LSU pair, not the old 64-bit one). Field ORDER is load-bearing
+  the package instantiates only `boot_req_t`/`boot_rsp_t` (64-bit data,
+  the bootrom macro and `native_ram`'s parameter defaults) from them; the
+  line- and tag-width pairs are expanded inside `cache_cntrl` from its own
+  geometry parameters instead, so no fixed-width copy of them can drift.
+  The two CPU-facing pairs are NOT macro-built — the ports have different
+  field sets, so they are hand-declared bit-identical to the yarv32-uc
+  core's `rv32_pkg` typedefs: `ifetch_req_t`/`ifetch_rsp_t` ($bits 34/66)
+  and the 32-bit `mem_req_t`/`mem_rsp_t` ($bits 71/35; note `mem_req_t`
+  is now the LSU pair, not the old 64-bit one). Field ORDER is load-bearing
   (struct connections are packed-vector copies) and pinned by
   elaboration-time `$bits` asserts in `cache_cntrl`. Width constants:
   `NATIVE_ADDR_W` (32, every port's addr field), `IFETCH_DATA_W` (64),
-  `LSU_DATA_W` (32), `LSU_STRB_W` (4), `CACHE_WIDTH` (256); `MEM_WIDTH`/
-  `STRB_WIDTH` remain for the macro-built internal pairs. `native_ram`
-  takes its pair as `parameter type REQ_T/RSP_T` (defaults: the boot
-  pair), and `cache_cntrl` defines local `way_req_t`/`way_rsp_t` (line
-  width) and `tag_req_t`/`tag_rsp_t` (tag width) from the same macros and
-  passes them to its macro instances — so port widths match at every
-  width, verified by elaboration-time `$bits` checks, and a WIDTH lint
-  warning now means a real bug (the sim Makefile no longer waives
-  `WIDTH`/`WIDTHEXPAND`/`WIDTHTRUNC`).
+  `LSU_DATA_W` (32), `LSU_STRB_W` (4). The unused `CACHE_WIDTH`,
+  `CACHE_STRB_WIDTH`, `MEM_WIDTH` and `STRB_WIDTH` constants and the
+  `cache_req_t`/`cache_rsp_t` pair are gone: outside `native_ram` nothing
+  checks a native port's addr width against its peer's, so a leftover
+  constant at the wrong width was a way to build a pair that connects
+  silently. `native_ram` takes its pair as `parameter type REQ_T/RSP_T`
+  (defaults: the boot pair), and `cache_cntrl` defines local
+  `way_req_t`/`way_rsp_t` (line width) and `tag_req_t`/`tag_rsp_t` (tag
+  width) from the same macros and passes them to its macro instances — so
+  port widths match at every width, verified by elaboration-time `$bits`
+  checks, and a WIDTH lint warning now means a real bug (the sim Makefile
+  no longer waives `WIDTH`/`WIDTHEXPAND`/`WIDTHTRUNC`).
 - `cache_cntrl` parameters beyond the geometry table below: `BOOTROM_FILE`
   (the bootrom's `$readmemh` image) and `CSR_RST_VAL` (the control
   register's power-on value). `fpga_top` forwards `BOOTROM_FILE`.
 - `native_ram` parameters: `ADDR_W`, `DATA_WIDTH`, `REQ_ADDR_W` (addr
   field width, default `NATIVE_ADDR_W`; the RAM decodes only the low
-  `ADDR_W` bits), `READ_ONLY`, `BYTE_WRITE`, `INIT_FILE` (optional
-  `$readmemh` preload, sim only), and `REQ_T`/`RSP_T` (protocol struct
-  pair, see above).
+  `ADDR_W` bits), `READ_ONLY`, `BYTE_WRITE`, `RAM_STYLE`, `INIT_FILE`
+  (optional `$readmemh` preload, sim only), and `REQ_T`/`RSP_T` (protocol
+  struct pair, see above).
 - `BYTE_WRITE` is a RESOURCE parameter. Gowin BSRAM has no byte write
   enable, so GowinSynthesis builds one by splitting the array into
   byte-wide blocks: a 256-bit line macro becomes 32 BSRAMs instead of 8,
@@ -137,6 +164,27 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   D-cache store hit, merges into the line the hit way already has on its
   registered output (`dcache_line`) and writes it back whole, costing no
   extra cycle and no extra port.
+- `RAM_STYLE` is the other RESOURCE parameter: `"block"` (default) puts
+  the array in BSRAM, `"distributed"` in LUT-based SSRAM. A Gowin BSRAM
+  block holds 18 kb and tops out at a data width of 32, so an array pays
+  one block per 32 bits of WIDTH before its depth counts for anything, and
+  a small array pays a whole block however little it holds. That is the
+  design's whole block budget, measured (yosys, `make lint-yosys`): the
+  four 128 x 256 bit data macros are 32 blocks — 8 apiece for width alone,
+  using 128 of 512 available words in each — and the four 128 x 16 bit tag
+  macros were the other 4, a full block each for 2048 bits, 11% of one.
+  The tag macros are therefore `RAM_STYLE("distributed")` and the data
+  macros stay in BSRAM (too wide for LUTs); the count went 36 to 32.
+  Neither style resets its contents, so the tag invalidation sweep is
+  needed either way.
+  Two mechanics worth knowing before touching this. A Verilog attribute
+  value must be a literal, so the two styles are two separate array
+  declarations inside a conditional generate, with everything that names
+  the array coming from the `NATIVE_RAM_*` macros defined just above them
+  — that is what keeps the branches from drifting apart. And both arms of
+  that generate are named `gen_store`, so the storage's hierarchical path
+  (`u_<inst>.gen_store.mem`) is the same whichever style an instance
+  picked, which is what the testbenches' preloads depend on.
 - `src/ips/sdram-controller/` — git submodule of
   `github.com/stffrdhrn/sdram-controller` (BSD), checked out on the local
   branch `gw2ar-32bit` (adapts upstream's hardcoded 16-bit data to the
@@ -170,9 +218,21 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   CPU-facing ports with the yarv32-uc types (`ifetch_*` fetches, 32-bit
   `mem_*` stores/loads): 8 posted word stores to ONE set with a different
   tag each (a 2-way cache therefore evicts through the writeback path),
-  the same 8 addresses read back and compared, then I-port fetches
-  checked for liveness only (power-on SDRAM content is unknown). A
-  watchdog turns a stuck port into FAIL instead of a dark board.
+  then the same 8 addresses stored TWICE more with partial byte strobes,
+  then the same 8 addresses read back TWICE each and compared against the
+  byte-wise merge of the three patterns, then I-port fetches checked for
+  liveness only (power-on SDRAM content is unknown). Each of those pairs
+  covers two different paths: the first partial store takes a store miss
+  and merges into the REFILLED line, the second hits and merges into the
+  RESIDENT one; the first read comes off the refill path, the second off
+  the array's registered output — two different word-select muxes, and
+  the two merges are the design's only board coverage of the byte-strobe
+  path. The word offset inside the line advances with the index so every
+  word select is used, and the patterns deliberately avoid the
+  `0xCAFE_xxxx` family `sdram_model` powers up holding: a CAFE pattern
+  compares equal to untouched device content at index 0, so a wrong-word
+  read would pass. A watchdog turns a stuck port into FAIL instead of a
+  dark board.
   `fail_code_o` says which failure it was (wrong data vs. a port that
   stopped answering, split by port) and `fail_state_o` latches
   `cache_cntrl.dbg_state_o` — the miss FSM's state — at that instant, so a
@@ -246,7 +306,9 @@ toolchain + `sim/sw` + `sim/cosim` trees, not yet present. Requires
   R/X/Y/Z phases handshake through the `d_access` (32-bit) / `i_load`
   (64-bit rdata) tasks instead of counting cycles, because they mix
   latencies that differ by two orders of magnitude. Preloads the tag/data
-  macros by hierarchical reference (`u_dut.gen_way[w].u_itag.mem` etc.) at
+  macros by hierarchical reference
+  (`u_dut.gen_way[w].u_itag.gen_store.mem` etc. — the `gen_store` level is
+  `native_ram`'s `RAM_STYLE` generate, see above) at
   time 0, indexed by the plain set index (the DUT applies the
   `TAG_BYTES_W` shift itself).
 - SDRAM power-up: `cache_cntrl` holds the controller in reset for
@@ -485,8 +547,8 @@ Hit *detection* is combinational (parallel tag compare) and never enters
 the FSM; only a miss triggers arbitration for the shared SDRAM controller
 (dcache wins ties, fixed priority). The miss FSM is COMPLETE end-to-end
 (TODO.md Phases 0–4 done): `S_IDLE` → `S_ARBITRATE` →
-(`S_WB_READ`/`S_WB_REQ`/`S_WB_WAIT` if the victim is dirty) →
-`S_REFILL_REQ`/`S_REFILL_WAIT` → `S_UPDATE_TAG` → `S_UNSTALL` → `S_IDLE`.
+(`S_WB_READ`/`S_WB_XFER` if the victim is dirty) → `S_REFILL_XFER` →
+`S_UPDATE_TAG` → `S_UNSTALL` → `S_IDLE`.
 Victim selection prefers an invalid way, else per-set round-robin
 (`rr_q`). Writeback streams the victim line straight off the data macro's
 registered output to the victim's address `{victim_tag, set, offset}`.
@@ -496,11 +558,12 @@ posted cycle; `S_UNSTALL` frees the missed skid slot, clears the queue
 block flags and pushes the load response in accept order — the port no
 longer wedges after a miss. D-cache store hits are posted writes through
 the byte-strobe mux into the hit way plus a tag dirty-bit set. The SDRAM
-side is the `sdram_controller` submodule (see Files): the miss FSM talks to
-its word-at-a-time host interface (`S_WB_ISSUE`/`S_REFILL_ISSUE` hold the
-enable until `busy` rises, writeback words complete on the busy fall,
-refill words are captured on the `rd_ready` pulse) — no placeholder
-completion signals. Remaining open items, marked `TODO` in source:
+side is the `sdram_controller` submodule (see Files), reached through
+`sdram_line_port`: the `*_XFER` states (and the bypass path's `S_BP_READ`
+/ `S_BP_WRITE`) issue ONE command and wait for its `done` pulse, so the
+per-word enable/busy/rd_ready handshakes are the engine's business and
+not the FSM's — no placeholder completion signals anywhere. Remaining
+open items, marked `TODO` in source:
 
 - The `gw2ar-32bit` submodule branch now lives on the fork
   `github.com/giacu92/sdram-controller` (`git submodule update --init`
@@ -618,15 +681,22 @@ Each phase keeps `make sim` green and `make format-check` clean.
 
 ### Phase 7 — Cleanup (can interleave)
 
-17. Delete dead code: the `offset`/`set_idx`/`tag` arrays' remaining dead
-    consumers, unused VERILATOR tap mirrors, `cache_req_t`/`cache_rsp_t`/
-    `CACHE_WIDTH` in the package, `native_ram`'s unused `REQ_ADDR_W`
-    parameter.
+17. Delete dead code — mostly DONE, and partly wrong as written. The
+    `offset`/`set_idx`/`tag` arrays are NOT dead: `offset[]` feeds
+    `idw_sel`/`dword_sel`, `set_idx[]` feeds both tag requests, `tag[]`
+    feeds `cmp_tag_q` (traced 2026-09-08). `cache_req_t`/`cache_rsp_t`/
+    `CACHE_WIDTH` are gone; `native_ram`'s `REQ_ADDR_W` is now used, by
+    the elaboration check on the request's addr width. What is left is the
+    `ifdef VERILATOR` wave-trace mirror block at the end of `cache_cntrl`
+    — it hand-copies two of roughly fourteen struct buses, so it is not a
+    consistent facility, and current Verilator traces packed structs into
+    VCD directly.
 18. Collapse the duplicated I/D always_comb blocks and macro instantiations
     behind a generate-for over the two caches.
-19. Make `sim/Makefile`'s `build` a stamped file target; document or remove
-    the `-Wno-MULTIDRIVEN` waiver; fix stale sim_top phase comments (Phase A
-    actually uses set 13 / tag 0x3CD, not "addr 0 set 0").
+19. Make `sim/Makefile`'s `build` a stamped file target. (The Verilator
+    waivers are gone — all five suppressed nothing by 2026-09-08 and were
+    deleted; the sim builds clean with none. The stale sim_top phase
+    comments were fixed in Phase 0.)
 
 ### Key context
 

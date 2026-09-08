@@ -27,6 +27,7 @@ TBUF_MODEL_NAME="tbuf_model.v"
 SOURCES=(
     "$ROOT/src/rtl/pkg/yarv32_cache_pkg.sv"
     "$ROOT/src/rtl/native_ram.sv"
+    "$ROOT/src/rtl/sdram_line_port.sv"
     "$ROOT/src/rtl/cache_cntrl.sv"
     "$ROOT/src/rtl/cache_bist.sv"
     "$ROOT/src/rtl/dbg_uart_tx.sv"

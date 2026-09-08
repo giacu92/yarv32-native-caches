@@ -185,8 +185,9 @@ All items completed 2026-08-31; `make sim` green, `make format-check` clean.
   load pushes the refilled doubleword into the response queue in accept
   order (4-way: pop / unblocked-head / blocked-head / empty queue); a store
   gets no response (posted, write-allocated dirty). Lookups are gated only
-  for the FSM-owned cache during `S_WB_READ`/`S_WB_REQ`/`S_WB_WAIT`/
-  `S_UPDATE_TAG` — hit-under-miss survives the refill; the D-port store-hit
+  for the FSM-owned cache during `S_WB_READ`/`S_WB_XFER`/`S_UPDATE_TAG`
+  (`S_WB_REQ`/`S_WB_WAIT` before Phase 11) — hit-under-miss survives the
+  refill; the D-port store-hit
   path and the FSM writes are mutually exclusive (single-outstanding D).
 - [x] D-cache store path: store-hit writes the hit way's data macro with
   the byte-strobe positioned by `cmp_dw_sel_q` and sets the tag's dirty bit
@@ -229,6 +230,8 @@ submodule at `src/ips/sdram-controller`, branch `gw2ar-32bit`:
   hold `wr/rd_enable` until `busy` rises (refresh may delay the accept),
   writeback words complete on the busy fall, refill words are captured on
   the `rd_ready` pulse — no placeholder completion signals left.
+  (Phase 11 moved those per-word handshakes into `sdram_line_port`; the
+  rules are unchanged, the state names are not.)
 - [x] Sim: `sdram_stub.sv` (transactional HS-IP stub that mirrored the
   FSM's own placeholder encodings) deleted; new `sim/sdram_model.sv` is a
   behavioral pin-level SDRAM (CL=3, BL=1, auto-precharge, row-open
@@ -345,9 +348,15 @@ Open:
   the BIST sits on a store/load until the watchdog fires. That is a stuck
   handshake, not wrong data, so the miss-FSM state at the failure is now
   latched and displayed too (second LED frame). Next run: read that state.
-  `S_REFILL_ISSUE`/`S_WB_ISSUE` means the controller never raised busy;
-  `S_REFILL_WAIT` means `rd_ready` never pulsed; `S_WB_WAIT` means busy
-  never fell. If the code ever turns into 01 (data mismatch) instead, the
+  `S_REFILL_XFER`/`S_WB_XFER` means the transfer never finished — which
+  of the three per-word stalls it is (the controller never raised busy,
+  `rd_ready` never pulsed, busy never fell) is now `sdram_line_port`'s
+  internal state, NOT `dbg_state_o`, since Phase 11 moved those handshakes
+  out of the FSM. Reading it on a board needs the engine's state exported
+  too; until then the cache state only says which PHASE hung.
+  (Before Phase 11 these were four distinct FSM states: `S_REFILL_ISSUE`/
+  `S_WB_ISSUE` = no busy, `S_REFILL_WAIT` = no `rd_ready`, `S_WB_WAIT` =
+  busy never fell.) If the code ever turns into 01 (data mismatch) instead, the
   lever is the clock phase: sweep `SDRAM_PSDA_SEL` in `fpga_top`
   ("1100" = 270 deg, "0100" = 90 deg).
   Third run read back state `S_IDLE`: the miss FSM was doing NOTHING when
@@ -543,7 +552,12 @@ redefining `mem_req_t` breaks every consumer at once).
   HIGH half (addr[2]=1), X/Y/Z 32-bit, `boot_lo`/`boot_hi` helpers.
 - [x] Verified: `make sim` (all phases), `make -C sim xrun`
   (`--x-initial unique`), `+RAM_GARBAGE`, `make bist`, `make -C sim xbist`,
-  `make lint-fpga`, `make format-check` — all green.
+  `make lint-fpga` — all green. CORRECTION (2026-09-08): the
+  `make format-check` half of that claim was wrong. `dbg_uart_tx.sv` was
+  already unformatted in this very commit and `cache_cntrl.sv` since
+  `f7b22ad`, so the gate was red from here to `58320c3` — three commits of
+  a red gate reported as green. Fixed by running `make format` (see
+  Phase 8).
 
 Open:
 
@@ -553,6 +567,50 @@ Open:
   gate-level check is the one that catches X-propagation through the
   split skid/queue state — run it on the Gowin host or after installing
   the tools before trusting a board build.
+
+## Phase 11 — SDRAM streaming engine split out — DONE (2026-09-08)
+
+The miss FSM had grown to 13 states, eight of them per-word SDRAM
+handshaking (`*_ISSUE`/`*_WAIT` pairs) rather than cache policy. That
+handshaking is the same three rules four times over, and it was
+interleaved with victim selection, line commit and unstall in one
+`always_comb`.
+
+- [x] New `src/rtl/sdram_line_port.sv`: takes a command (direction,
+  length in 32-bit words, first word address) and runs the controller's
+  per-word protocol itself. See CLAUDE.md for the contract; the two
+  non-obvious parts are that `cmd_wdata_i` is NOT registered (the caller
+  holds it — the cache's writeback source is already held by the lookup
+  gate, and a line of flops here would buy nothing) and that `rdata_o`
+  holds after `done_o`, so a short read leaves the upper words stale.
+- [x] `cache_cntrl` miss FSM: 13 states → 9. `S_WB_ISSUE`/`S_WB_WAIT` →
+  `S_WB_XFER`; `S_REFILL_ISSUE`/`S_REFILL_WAIT` → `S_REFILL_XFER`;
+  `S_BP_RD_ISSUE`/`S_BP_RD_WAIT`/`S_BP_WR_ISSUE`/`S_BP_WR_WAIT` →
+  `S_BP_READ`/`S_BP_WRITE`. `burst_cnt_q` and the 256-bit `line_buf_q`
+  are gone from the FSM (the engine owns both); `commit_line` and the
+  unstall response data read `eng_rdata` instead. The FSM's `always_comb`
+  went 175 → 124 lines and now contains no `sdram_*` signal at all.
+- [x] A dead path went with it: the old `S_BP_WR_WAIT` looped back for a
+  further bypass word, but a bypass store is D-only and a D bypass is one
+  word, so `bp_last` was always true there.
+- [x] Cost: one cycle per COMMAND (at most four per miss) for the
+  command accept, which the inline version did not spend. `make bist`
+  went 273.05 us → 274.29 us, ~62 cycles at 50 MHz.
+- [x] `BUILD_ID` bumped to 13: the FSM state encoding `dbg_state_o`
+  reports has changed, so two builds must not print the same `V`.
+- [x] Verified: `make -C sim run` (all phases) + `+RAM_GARBAGE` + `xrun`,
+  `make -C sim bist` + `+RAM_GARBAGE` + `xbist`, `make lint-yosys`,
+  `make format-check` (unchanged pre-existing failures only). Mutation-
+  tested the engine three ways — dropped word-address increment,
+  `last_word` forced true, `cmd_we_i` ignored — each caught by `make sim`.
+
+Open:
+
+- [ ] The board's failure decoder lost resolution: a hang inside a
+  transfer now reads as `S_WB_XFER`/`S_REFILL_XFER` instead of naming
+  which per-word handshake stalled. Export `sdram_line_port`'s state
+  alongside `dbg_state_o` before the next bring-up run (see Phase 6's
+  fail-code notes).
 
 ## Phase 7 — Verification hardening
 
@@ -568,15 +626,47 @@ Open:
 ## Phase 8 — Cleanup (interleave with the above)
 
 - [ ] Collapse the duplicated I/D always_comb blocks and macro instances
-  behind a generate-for over the two caches (CLAUDE.md item 18).
-- [ ] Delete dead code: `offset`/`set_idx`/`tag` arrays' dead consumers,
-  remaining VERILATOR tap mirrors, `cache_req_t`/`cache_rsp_t`/
-  `CACHE_WIDTH` if unused, `native_ram`'s unused `REQ_ADDR_W`.
+  behind a generate-for over the two caches (CLAUDE.md item 18). NOTE:
+  Phase 10 weakened this one — the two ports now genuinely differ (64-bit
+  read-only I vs 32-bit byte-strobed D, split skid/queue state), so a full
+  collapse means parameterizing over that difference and may well be worse
+  than the duplication. Re-decide before doing it.
+- [x] Dead package types deleted 2026-09-08: `cache_req_t`/`cache_rsp_t`/
+  `CACHE_WIDTH`/`CACHE_STRB_WIDTH`/`MEM_WIDTH`/`STRB_WIDTH`.
+  `native_ram`'s `REQ_ADDR_W` is now used, by the elaboration check on the
+  request's addr width.
+- [x] The `offset`/`set_idx`/`tag` arrays are NOT dead — this item was
+  wrong. Traced 2026-09-08: `offset[]` feeds `idw_sel`/`dword_sel`
+  (`cache_cntrl.sv:881-882`), `set_idx[]` feeds both tag requests
+  (`:898`, `:908`), `tag[]` feeds `cmp_tag_q` (`:1160`). Nothing to do.
+- [ ] Remaining VERILATOR tap mirrors: the `ifdef VERILATOR` block at the
+  end of `cache_cntrl` mirrors `icache_req_i` and `itag_req[0]`/
+  `itag_rsp[0]` field by field. It covers two of ~14 struct buses, so it
+  is not a consistent debug facility, and current Verilator traces packed
+  structs into VCD directly. Confirm nobody relies on it, then delete.
 - [x] Fix stale sim_top phase comments (Phase A actually uses set 13 /
   tag 0x3CD, not "addr 0 set 0") — done in Phase 0 (comments rewritten with
   the rdata checks).
-- [ ] `sim/Makefile`: make `build` a stamped file target; document or remove
-  the `-Wno-MULTIDRIVEN` waiver; consider removing `-Wno-UNUSED` (it hid the
-  dead `dcache_line`).
+- [x] `make format-check` green again (2026-09-08). It had been red since
+  `dc3498e`: eight lines of HAND-aligned `localparam` groups in
+  `cache_cntrl.sv`, `dbg_uart_tx.sv`, `bist_tb.sv`, `sdram_model.sv` that
+  verible reformats flush. Checked first whether the flagfile could keep
+  the hand alignment — all four `--module_net_variable_alignment` modes
+  (`align`, `preserve`, `flush-left`, `infer`) reformat these groups the
+  same way, so the answer is to take verible's output and stop
+  hand-aligning localparam groups, not to tune `verible.flags`. Run
+  `make format` before committing; `make format-diff` shows what it will
+  do.
+- [x] `sim/Makefile`: ALL FIVE Verilator waivers removed 2026-09-08
+  (`-Wno-UNUSED`, `-Wno-CASEINCOMPLETE`, `-Wno-UNOPTFLAT`,
+  `-Wno-INITIALDLY`, `-Wno-MULTIDRIVEN`, plus the four on `lint-fpga`).
+  Measured first: a from-scratch `--binary --timing --trace` build of both
+  sims and the `fpga_top` lint emit no warnings with none of them, so all
+  five were suppressing nothing. They are deleted rather than kept "just
+  in case" — a waiver's whole cost is what it hides on the day it starts
+  mattering, and `-Wno-UNUSED` is what hid the dead `dcache_line`.
+- [ ] `sim/Makefile`: make `build` a stamped file target (it is `.PHONY`,
+  so every `make run` re-runs Verilator: ~3 s for sim_top, ~13 s for
+  bist). Low priority — not the bottleneck.
 - [ ] Update CLAUDE.md to match reality (geometry, protocol status, this
   plan superseding the inline one).

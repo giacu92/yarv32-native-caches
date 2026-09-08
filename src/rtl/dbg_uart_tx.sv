@@ -33,10 +33,10 @@ module dbg_uart_tx #(
 );
 
     localparam int DIVISOR = (CLK_HZ + BAUD / 2) / BAUD;
-    localparam int DIV_W   = $clog2(DIVISOR);
+    localparam int DIV_W = $clog2(DIVISOR);
 
     // 10 bits on the wire: start, 8 data, stop.
-    localparam int N_BITS  = 10;
+    localparam int N_BITS = 10;
 
     logic [DIV_W-1:0] div_q;
     logic [      3:0] bit_q;  // 0 = idle, else bits remaining

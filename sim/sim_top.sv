@@ -238,38 +238,38 @@ module sim_top;
         @(posedge clk);
 
         // Way 0 holds a valid tag for the hit addresses, way 1 stays invalid.
-        u_dut.gen_way[0].u_itag.mem[set_of(ADDR_I_HIT)] = tag_word(ADDR_I_HIT);
-        u_dut.gen_way[1].u_itag.mem[set_of(ADDR_I_HIT)] = {TAG_DATA_W{1'b0}};
-        u_dut.gen_way[0].u_icache.mem[DATA_WORD_I_HIT] = LINE_PATTERN;
+        u_dut.gen_way[0].u_itag.gen_store.mem[set_of(ADDR_I_HIT)] = tag_word(ADDR_I_HIT);
+        u_dut.gen_way[1].u_itag.gen_store.mem[set_of(ADDR_I_HIT)] = {TAG_DATA_W{1'b0}};
+        u_dut.gen_way[0].u_icache.gen_store.mem[DATA_WORD_I_HIT] = LINE_PATTERN;
 
-        u_dut.gen_way[0].u_dtag.mem[set_of(ADDR_D_HIT)] = tag_word(ADDR_D_HIT);
-        u_dut.gen_way[1].u_dtag.mem[set_of(ADDR_D_HIT)] = {TAG_DATA_W{1'b0}};
-        u_dut.gen_way[0].u_dcache.mem[DATA_WORD_D_HIT] = LINE_PATTERN;
+        u_dut.gen_way[0].u_dtag.gen_store.mem[set_of(ADDR_D_HIT)] = tag_word(ADDR_D_HIT);
+        u_dut.gen_way[1].u_dtag.gen_store.mem[set_of(ADDR_D_HIT)] = {TAG_DATA_W{1'b0}};
+        u_dut.gen_way[0].u_dcache.gen_store.mem[DATA_WORD_D_HIT] = LINE_PATTERN;
 
         // Phase-B miss set: a VALID tag whose value differs from the
         // requested one, so only the tag equality can rule out a hit.
-        u_dut.gen_way[0].u_itag.mem[set_of(ADDR_I_MISS)] = {{(TAG_DATA_W - TAG_FIELD_W - 2) {1'b0}},
-                                                            11'h555, 1'b0, 1'b1};
-        u_dut.gen_way[1].u_itag.mem[set_of(ADDR_I_MISS)] = {TAG_DATA_W{1'b0}};
+        u_dut.gen_way[0].u_itag.gen_store.mem[set_of(ADDR_I_MISS)] =
+            {{(TAG_DATA_W - TAG_FIELD_W - 2) {1'b0}}, 11'h555, 1'b0, 1'b1};
+        u_dut.gen_way[1].u_itag.gen_store.mem[set_of(ADDR_I_MISS)] = {TAG_DATA_W{1'b0}};
 
         // Phase-E way-1 hit set: way 1 valid with its own tag and line,
         // way 0 invalid.
-        u_dut.gen_way[0].u_itag.mem[set_of(ADDR_I_WAY1)] = {TAG_DATA_W{1'b0}};
-        u_dut.gen_way[1].u_itag.mem[set_of(ADDR_I_WAY1)] = tag_word(ADDR_I_WAY1);
-        u_dut.gen_way[1].u_icache.mem[DATA_WORD_I_WAY1] = LINE_PATTERN_W1;
+        u_dut.gen_way[0].u_itag.gen_store.mem[set_of(ADDR_I_WAY1)] = {TAG_DATA_W{1'b0}};
+        u_dut.gen_way[1].u_itag.gen_store.mem[set_of(ADDR_I_WAY1)] = tag_word(ADDR_I_WAY1);
+        u_dut.gen_way[1].u_icache.gen_store.mem[DATA_WORD_I_WAY1] = LINE_PATTERN_W1;
 
         // Phase-H D-miss set: BOTH ways valid, neither matching the
         // requested tag.
-        u_dut.gen_way[0].u_dtag.mem[set_of(ADDR_D_MISS2)] = tag_word_v(11'h111);
-        u_dut.gen_way[1].u_dtag.mem[set_of(ADDR_D_MISS2)] = tag_word_v(11'h222);
+        u_dut.gen_way[0].u_dtag.gen_store.mem[set_of(ADDR_D_MISS2)] = tag_word_v(11'h111);
+        u_dut.gen_way[1].u_dtag.gen_store.mem[set_of(ADDR_D_MISS2)] = tag_word_v(11'h222);
 
         // Phase-V eviction set 77: way 0 = line A (tag 0x111), way 1 = a
         // valid filler line (tag 0x333, clean). Both valid, so the eviction
         // victim is the round-robin pointer (way 0 first — line A).
-        u_dut.gen_way[0].u_dtag.mem[set_of(ADDR_A_EV)] = tag_word_v(11'h111);
-        u_dut.gen_way[1].u_dtag.mem[set_of(ADDR_A_EV)] = tag_word_v(11'h333);
-        u_dut.gen_way[0].u_dcache.mem[set_of(ADDR_A_EV)] = LINE_PATTERN;
-        u_dut.gen_way[1].u_dcache.mem[set_of(ADDR_A_EV)] = LINE_PATTERN_W1;
+        u_dut.gen_way[0].u_dtag.gen_store.mem[set_of(ADDR_A_EV)] = tag_word_v(11'h111);
+        u_dut.gen_way[1].u_dtag.gen_store.mem[set_of(ADDR_A_EV)] = tag_word_v(11'h333);
+        u_dut.gen_way[0].u_dcache.gen_store.mem[set_of(ADDR_A_EV)] = LINE_PATTERN;
+        u_dut.gen_way[1].u_dcache.gen_store.mem[set_of(ADDR_A_EV)] = LINE_PATTERN_W1;
     end
 
     // Watchdog budget: the 200 us SDRAM power-up wait (20 000 cycles at

@@ -183,11 +183,10 @@ module cache_cntrl #(
     localparam int TAG_ADDR_W = NBIT_SET_IDX + TAG_BYTES_W;
 
     // Per-instance protocol types, re-expanded from the package macros at
-    // this module's own geometry (the package cache_req_t is the
-    // fixed-width instance of the same macro). way_*_t is one whole
-    // cache line wide; tag_*_t is one tag word wide. This keeps the
-    // native_ram port widths and the arrays below matched by construction
-    // for any CL_SIZE / N_WAY / CACHE_SIZE parameterization.
+    // this module's own geometry. way_*_t is one whole cache line wide;
+    // tag_*_t is one tag word wide. This keeps the native_ram port widths
+    // and the arrays below matched by construction for any
+    // CL_SIZE / N_WAY / CACHE_SIZE parameterization.
     `YARV_MEM_TYPES(way_req_t, way_rsp_t, yarv32_cache_pkg::NATIVE_ADDR_W, DATA_WIDTH)
     `YARV_MEM_TYPES(tag_req_t, tag_rsp_t, yarv32_cache_pkg::NATIVE_ADDR_W, TAG_DATA_W)
 
@@ -226,6 +225,16 @@ module cache_cntrl #(
                     yarv32_cache_pkg::ifetch_rsp_t
                 )
             );
+        assert ($bits(yarv32_cache_pkg::mem_req_t) == 71)
+        else
+            $fatal(
+                1, "mem_req_t is %0d bits, rv32_pkg says 71", $bits(yarv32_cache_pkg::mem_req_t)
+            );
+        assert ($bits(yarv32_cache_pkg::mem_rsp_t) == 35)
+        else
+            $fatal(
+                1, "mem_rsp_t is %0d bits, rv32_pkg says 35", $bits(yarv32_cache_pkg::mem_rsp_t)
+            );
     end
 `endif
 
@@ -258,6 +267,17 @@ module cache_cntrl #(
     logic [20:0] sdram_wr_addr;
     logic [31:0] sdram_rd_data;
     logic [31:0] sdram_wr_data;
+
+    // Command interface to sdram_line_port, which owns those nets and
+    // turns them into "move N consecutive words" for the miss FSM.
+    logic eng_cmd_valid;
+    logic eng_cmd_ready;
+    logic eng_cmd_we;
+    logic [3:0] eng_cmd_words;
+    logic [MEM_SIZE-1:2] eng_cmd_addr;
+    logic [DATA_WIDTH-1:0] eng_cmd_wdata;  // must hold until eng_done
+    logic eng_done;
+    logic [DATA_WIDTH-1:0] eng_rdata;  // words captured by the last read
 
     // Per-cache request skid, slot-indexed (freed slots are reused as a
     // free list; at most one slot is ever un-launched, so launch order =
@@ -344,9 +364,9 @@ module cache_cntrl #(
     //   TGT_CSR   : control register read/write
     // -------------------------------------------------------------
     localparam logic [1:0] TGT_CACHE = 2'd0;
-    localparam logic [1:0] TGT_MEM   = 2'd1;
-    localparam logic [1:0] TGT_BOOT  = 2'd2;
-    localparam logic [1:0] TGT_CSR   = 2'd3;
+    localparam logic [1:0] TGT_MEM = 2'd1;
+    localparam logic [1:0] TGT_BOOT = 2'd2;
+    localparam logic [1:0] TGT_CSR = 2'd3;
 
     logic [N_CACHE-1:0][N_SLOT-1:0][1:0] slot_tgt_q;  // target of each occupied slot
     logic [N_CACHE-1:0][1:0] acc_tgt;  // target of the request being offered now
@@ -665,6 +685,15 @@ module cache_cntrl #(
     // wide (halved vs. a single direct-mapped macro at N_WAY=2); tag
     // macros are TAG_ADDR_W wide (one tag word per set, see TAG_ADDR_W).
     //
+    // The four TAG macros are RAM_STYLE("distributed"): 128 words of
+    // TAG_DATA_W (16) bits is 2048 bits, and a Gowin BSRAM block holds
+    // 18 kb, so each tag array spent a whole block on 11% of it — 4 of
+    // the design's 36 blocks. In LUT-based SSRAM they cost none. The four
+    // DATA macros stay in BSRAM: at DATA_WIDTH 256 they are 32 of the 36
+    // blocks (BSRAM tops out at x32, so 8 blocks apiece for width alone)
+    // and far too big for LUTs. Neither style resets its contents, so the
+    // tag invalidation sweep below is needed either way.
+    //
     // All eight are BYTE_WRITE(0): every write here commits a whole word.
     // Gowin BSRAM has no byte write enable, so a byte-writable 256-bit
     // line macro is built out of 32 byte-wide blocks instead of 8 —
@@ -712,8 +741,9 @@ module cache_cntrl #(
                 .REQ_T     (tag_req_t),
                 .RSP_T     (tag_rsp_t),
                 .READ_ONLY (0),
-                .BYTE_WRITE(0),           // whole-line writes only, see the store-hit merge
-                .INIT_FILE ("")
+                .BYTE_WRITE(0),             // whole-word writes only, see the store-hit merge
+                .INIT_FILE (""),
+                .RAM_STYLE ("distributed")  // LUT SSRAM: see the tag-macro note above
             ) u_itag (
                 .clk_i    (clk_i),
                 .rstn_i   (rstn_i),
@@ -727,8 +757,9 @@ module cache_cntrl #(
                 .REQ_T     (tag_req_t),
                 .RSP_T     (tag_rsp_t),
                 .READ_ONLY (0),
-                .BYTE_WRITE(0),           // whole-line writes only, see the store-hit merge
-                .INIT_FILE ("")
+                .BYTE_WRITE(0),             // whole-word writes only, see the store-hit merge
+                .INIT_FILE (""),
+                .RAM_STYLE ("distributed")  // LUT SSRAM: see the tag-macro note above
             ) u_dtag (
                 .clk_i    (clk_i),
                 .rstn_i   (rstn_i),
@@ -814,6 +845,34 @@ module cache_cntrl #(
     );
 
     assign sdram_clk_o = sdram_clk_i;
+
+    // SDRAM streaming engine. The miss FSM asks it for whole-line (or
+    // single-word) transfers; every per-word handshake with the controller
+    // lives inside it. See sdram_line_port.sv for the command contract --
+    // in particular that cmd_wdata must hold until done.
+    sdram_line_port #(
+        .MEM_SIZE(MEM_SIZE),
+        .LINE_W  (DATA_WIDTH)
+    ) u_sdram_port (
+        .clk_i           (clk_i),
+        .rstn_i          (rstn_i),
+        .cmd_valid_i     (eng_cmd_valid),
+        .cmd_ready_o     (eng_cmd_ready),
+        .cmd_we_i        (eng_cmd_we),
+        .cmd_words_i     (eng_cmd_words),
+        .cmd_addr_i      (eng_cmd_addr),
+        .cmd_wdata_i     (eng_cmd_wdata),
+        .done_o          (eng_done),
+        .rdata_o         (eng_rdata),
+        .sdram_rd_en_o   (sdram_rd_en),
+        .sdram_rd_addr_o (sdram_rd_addr),
+        .sdram_rd_data_i (sdram_rd_data),
+        .sdram_rd_ready_i(sdram_rd_ready),
+        .sdram_wr_en_o   (sdram_wr_en),
+        .sdram_wr_addr_o (sdram_wr_addr),
+        .sdram_wr_data_o (sdram_wr_data),
+        .sdram_busy_i    (sdram_busy)
+    );
 
 
     // ===================================================================
@@ -1251,12 +1310,13 @@ module cache_cntrl #(
     // victim way, then unstall the requester (free the slot, push the
     // response in accept order) and return to S_IDLE.
     //
-    // SDRAM access model (sdram_controller host interface): one 32-bit
-    // word per transaction, no bursts. Refill = BURST_LEN single-word
-    // reads, writeback = BURST_LEN single-word writes. Handshake: an
-    // enable is held until busy rises (accept; refresh may delay it),
-    // a read completes on the rd_ready pulse, a write when busy falls —
-    // no placeholder completion signals.
+    // SDRAM access model: the controller moves one 32-bit word per
+    // transaction, so a refill is BURST_LEN word reads and a writeback
+    // BURST_LEN word writes. Those per-word handshakes are NOT here — they
+    // are sdram_line_port's job (see its header). This FSM issues one
+    // command per phase and waits for eng_done, which is what keeps it
+    // readable as the policy it is: arbitrate, pick a victim, write it
+    // back, refill, commit, unstall.
 
     localparam int BURST_LEN = DATA_WIDTH / 32;  // 32-bit SDRAM data bus
 
@@ -1264,10 +1324,8 @@ module cache_cntrl #(
         S_IDLE,
         S_ARBITRATE,
         S_WB_READ,  // read the victim line out of its data macro
-        S_WB_ISSUE,  // writeback word handshake; skipped if victim not dirty
-        S_WB_WAIT,  // wait for the accepted write word to complete
-        S_REFILL_ISSUE,  // refill word read handshake
-        S_REFILL_WAIT,  // wait for rd_ready, capture the word
+        S_WB_XFER,  // stream the victim line out; skipped if victim not dirty
+        S_REFILL_XFER,  // stream the missing line in
         S_UPDATE_TAG,  // commit line + tag into the victim way
         S_UNSTALL,  // free the missed slot, deliver the response
         // Cache-bypass path (TGT_MEM): the CPU datum straight to/from the
@@ -1276,10 +1334,8 @@ module cache_cntrl #(
         // unless the store strobes all four of its bytes — the controller
         // drives dqm itself, so a partial word cannot be masked at the
         // pins.
-        S_BP_RD_ISSUE,
-        S_BP_RD_WAIT,
-        S_BP_WR_ISSUE,
-        S_BP_WR_WAIT
+        S_BP_READ,
+        S_BP_WRITE
     } fsm_state_e;
 
     fsm_state_e state_q, state_d;
@@ -1345,8 +1401,6 @@ module cache_cntrl #(
     };
 
     logic req_sel_q, req_sel_d;  // 0 = icache, 1 = dcache
-    logic [3:0] burst_cnt_q, burst_cnt_d;  // 0 .. BURST_LEN-1
-    logic [DATA_WIDTH-1:0] line_buf_q, line_buf_d;  // staged/assembled cache line
     logic [yarv32_cache_pkg::NATIVE_ADDR_W-1:0] miss_addr_q, miss_addr_d;
     logic [$clog2(N_SLOT)-1:0] miss_slot_q, miss_slot_d;  // skid slot the FSM owns
     logic byp_q, byp_d;  // the latched slot is a cache-bypass access
@@ -1374,16 +1428,12 @@ module cache_cntrl #(
         if (!rstn_i) begin
             state_q     <= S_IDLE;
             req_sel_q   <= 1'b0;
-            burst_cnt_q <= '0;
-            line_buf_q  <= '0;
             miss_addr_q <= '0;
             miss_slot_q <= '0;
             byp_q       <= 1'b0;
         end else begin
             state_q     <= state_d;
             req_sel_q   <= req_sel_d;
-            burst_cnt_q <= burst_cnt_d;
-            line_buf_q  <= line_buf_d;
             miss_addr_q <= miss_addr_d;
             miss_slot_q <= miss_slot_d;
             byp_q       <= byp_d;
@@ -1394,8 +1444,9 @@ module cache_cntrl #(
     // {victim_tag, set, offset 0} — NOT the missing address (that would
     // overwrite the missing line's own SDRAM location with victim data);
     // refill reads the missing line itself. The controller's host address
-    // is the 32-bit word index {bank, row, col} = byte_addr[22:2], so the
-    // per-word index is the line base word + burst_cnt_q.
+    // is the 32-bit word index {bank, row, col} = byte_addr[22:2], which is
+    // what the engine is given as the command's FIRST word; it walks the
+    // rest of the line from there.
     logic [22:0] wb_byte_addr, refill_byte_addr;
     assign wb_byte_addr = {
         victim_tag_q[req_sel_q][miss_slot_q],
@@ -1404,18 +1455,19 @@ module cache_cntrl #(
     };
     assign refill_byte_addr = {miss_addr_q[MEM_SIZE-1:NBIT_OFFSET], {NBIT_OFFSET{1'b0}}};
 
-    // Cache-bypass datapath. The owning port sets the transfer width
+    // Cache-bypass datapath. The owning port sets the transfer length
     // (req_sel_q, latched in S_IDLE): an I bypass moves a 64-bit
-    // doubleword as two 32-bit SDRAM words (burst_cnt_q[0] selects which),
-    // a D bypass moves one word. Only the D port can store (the I port is
-    // read-only), so the store datapath below reads dskid_q unconditionally
-    // — gated by req_sel_q so an I bypass sees zeros, never stale D state.
+    // doubleword as two consecutive 32-bit SDRAM words, a D bypass moves
+    // one. The engine walks the words itself, so what it needs here is the
+    // FIRST word address — which for the I case is the doubleword base,
+    // hence the forced zero in the low bit. Only the D port can store (the
+    // I port is read-only), so the store datapath below reads dskid_q
+    // unconditionally — gated by req_sel_q so an I bypass sees zeros,
+    // never stale D state.
     wire [3:0] bp_words = req_sel_q ? 4'd1 : 4'd2;
 
-    wire bp_hi = burst_cnt_q[0];  // 1 = upper 32 bits of the doubleword
-    wire bp_last = (burst_cnt_q == bp_words - 4'd1);
     wire [MEM_SIZE-1:2]
-        bp_word_addr = req_sel_q ? miss_addr_q[MEM_SIZE-1:2] : {miss_addr_q[MEM_SIZE-1:3], bp_hi};
+        bp_base_addr = req_sel_q ? miss_addr_q[MEM_SIZE-1:2] : {miss_addr_q[MEM_SIZE-1:3], 1'b0};
 
     wire [3:0] bp_strb = req_sel_q ? dskid_q[miss_slot_q].wstrb : 4'h0;
     wire [31:0] bp_wdata = req_sel_q ? dskid_q[miss_slot_q].wdata : 32'h0;
@@ -1430,35 +1482,43 @@ module cache_cntrl #(
     logic [31:0] bp_wr_data;
 
     always_comb begin
-        bp_wr_data = line_buf_q[31:0];
+        bp_wr_data = eng_rdata[31:0];
         for (int b = 0; b < 4; b++) begin
             if (bp_strb[b]) bp_wr_data[b*8+:8] = bp_wdata[b*8+:8];
         end
     end
 
+    // Engine write data. Word 0 carries a bypass store's merged word; all
+    // the higher words are only ever consumed by a line writeback, so the
+    // victim line drives them unconditionally rather than through a
+    // DATA_WIDTH-wide mux that would select between a line and 224 bits of
+    // zero.
+    always_comb begin
+        eng_cmd_wdata = fsm_victim_line;
+        if (byp_q) eng_cmd_wdata[31:0] = bp_wr_data;
+    end
+
     always_comb begin
         // defaults: hold state / datapath
-        state_d = state_q;
-        req_sel_d = req_sel_q;
-        burst_cnt_d = burst_cnt_q;
-        line_buf_d = line_buf_q;
-        miss_addr_d = miss_addr_q;
-        miss_slot_d = miss_slot_q;
-        byp_d = byp_q;
+        state_d       = state_q;
+        req_sel_d     = req_sel_q;
+        miss_addr_d   = miss_addr_q;
+        miss_slot_d   = miss_slot_q;
+        byp_d         = byp_q;
 
-        sdram_rd_en = 1'b0;
-        sdram_wr_en = 1'b0;
-        // Line traffic (writeback / refill) walks the line word by word;
-        // a bypass addresses the CPU doubleword directly.
-        sdram_wr_addr = byp_q ? bp_word_addr : (wb_byte_addr[MEM_SIZE-1:2] + {17'd0, burst_cnt_q});
-        sdram_wr_data = byp_q ? bp_wr_data : fsm_victim_line[burst_cnt_q*32+:32];
-        sdram_rd_addr = byp_q ?
-            bp_word_addr : (refill_byte_addr[MEM_SIZE-1:2] + {17'd0, burst_cnt_q});
+        // Engine command defaults. In the transfer states below cmd_valid
+        // is simply tied to the engine's own ready: that is the whole
+        // handshake, because the engine keeps ready low through the cycle
+        // it pulses done, so a command cannot be re-issued in the cycle it
+        // is seen to finish.
+        eng_cmd_valid = 1'b0;
+        eng_cmd_we    = 1'b0;
+        eng_cmd_words = 4'd1;
+        eng_cmd_addr  = bp_base_addr;
 
         unique case (state_q)
 
             S_IDLE: begin
-                burst_cnt_d = '0;
                 if (miss_pending) begin
                     // Fixed priority: dcache wins ties (avoids stalling
                     // stores). cache_fsm_latch (above) marks the picked-up
@@ -1481,70 +1541,41 @@ module cache_cntrl #(
                 // pulse (victim_*_q, per slot — see the skid block). Only a
                 // valid AND dirty victim needs its line written back before
                 // the refill overwrites the way.
-                burst_cnt_d = '0;
+                //
                 // A bypass has no victim (no tag lookup ever ran for it,
                 // so victim_*_q hold whatever the previous miss left) and
                 // no line: straight to the word transfer.
-                if (byp_q) state_d = S_BP_RD_ISSUE;
+                if (byp_q) state_d = S_BP_READ;
                 else
                     state_d = (victim_valid_q[req_sel_q][miss_slot_q] &&
-                               victim_dirty_q[req_sel_q][miss_slot_q]) ? S_WB_READ : S_REFILL_ISSUE;
+                               victim_dirty_q[req_sel_q][miss_slot_q]) ? S_WB_READ : S_REFILL_XFER;
             end
 
             S_WB_READ: begin
                 // The data-macro read of the victim line is driven by the
                 // FSM request mux (fsm_way_req): it launches this cycle and
-                // the data is valid from S_WB_ISSUE on, held in the macro's
-                // rdata_q (lookups are gated through S_WB_WAIT, so no other
-                // read can clobber it).
-                state_d = S_WB_ISSUE;
+                // the data is valid from S_WB_XFER on, held in the macro's
+                // rdata_q (lookups are gated for the whole writeback, so no
+                // other read can clobber it — which is also what lets the
+                // engine read its write data straight off that output).
+                state_d = S_WB_XFER;
             end
 
-            S_WB_ISSUE: begin
-                // Present the write word until the controller accepts it
-                // (busy rises a cycle after the accept edge; a due refresh
-                // delays the accept, so hold, don't pulse). Deassert on
-                // accept: an enable still up when the controller returns to
-                // IDLE would be latched as another request.
-                sdram_wr_en = !sdram_busy;
-                if (sdram_busy) state_d = S_WB_WAIT;
+            S_WB_XFER: begin
+                // The victim's own line address: {victim_tag, set, 0}.
+                eng_cmd_valid = eng_cmd_ready;
+                eng_cmd_we    = 1'b1;
+                eng_cmd_words = 4'(BURST_LEN);
+                eng_cmd_addr  = wb_byte_addr[MEM_SIZE-1:2];
+                if (eng_done) state_d = S_REFILL_XFER;
             end
 
-            S_WB_WAIT: begin
-                // The accepted word is done when busy falls (the controller
-                // sits in IDLE again). Advance to the next word, or to the
-                // refill once the whole line is out.
-                if (!sdram_busy) begin
-                    // Zero-extend so the 4-bit counter compares width-clean
-                    // against the 32-bit int localparam.
-                    if ({28'd0, burst_cnt_q} == BURST_LEN - 1) begin
-                        burst_cnt_d = '0;
-                        state_d     = S_REFILL_ISSUE;
-                    end else begin
-                        burst_cnt_d = burst_cnt_q + 1'b1;
-                        state_d     = S_WB_ISSUE;
-                    end
-                end
-            end
-
-            S_REFILL_ISSUE: begin
-                // Present the read word address until accepted (see
-                // S_WB_ISSUE on the hold-vs-pulse question).
-                sdram_rd_en = !sdram_busy;
-                if (sdram_busy) state_d = S_REFILL_WAIT;
-            end
-
-            S_REFILL_WAIT: begin
-                // The controller's per-word data-valid strobe: rd_ready is a
-                // one-cycle pulse carrying the word on rd_data.
-                if (sdram_rd_ready) begin
-                    line_buf_d[burst_cnt_q*32+:32] = sdram_rd_data;
-                    if ({28'd0, burst_cnt_q} == BURST_LEN - 1) state_d = S_UPDATE_TAG;
-                    else begin
-                        burst_cnt_d = burst_cnt_q + 1'b1;
-                        state_d     = S_REFILL_ISSUE;
-                    end
-                end
+            S_REFILL_XFER: begin
+                // The missing line itself; the words land in eng_rdata.
+                eng_cmd_valid = eng_cmd_ready;
+                eng_cmd_words = 4'(BURST_LEN);
+                eng_cmd_addr  = refill_byte_addr[MEM_SIZE-1:2];
+                if (eng_done) state_d = S_UPDATE_TAG;
             end
 
             S_UPDATE_TAG: begin
@@ -1564,50 +1595,30 @@ module cache_cntrl #(
                 state_d = S_IDLE;
             end
 
-            // ---- cache-bypass transfer (byp_q), one word at a time ----
+            // ---- cache-bypass transfer (byp_q) ----
 
-            S_BP_RD_ISSUE: begin
+            S_BP_READ: begin
                 // A full-word store overwrites everything the read would
-                // have returned, so skip it.
+                // have returned, so skip it. Otherwise fetch the whole
+                // access in one command: one word for a D bypass, the two
+                // words of the doubleword for an I one.
                 if (bp_skip_read) begin
-                    state_d = S_BP_WR_ISSUE;
+                    state_d = S_BP_WRITE;
                 end else begin
-                    sdram_rd_en = !sdram_busy;
-                    if (sdram_busy) state_d = S_BP_RD_WAIT;
+                    eng_cmd_valid = eng_cmd_ready;
+                    eng_cmd_words = bp_words;
+                    if (eng_done) state_d = miss_is_store ? S_BP_WRITE : S_UNSTALL;
                 end
             end
 
-            S_BP_RD_WAIT: begin
-                if (sdram_rd_ready) begin
-                    if (bp_hi) line_buf_d[63:32] = sdram_rd_data;
-                    else line_buf_d[31:0] = sdram_rd_data;
-                    if (miss_is_store) begin
-                        state_d = S_BP_WR_ISSUE;
-                    end else if (bp_last) begin
-                        state_d = S_UNSTALL;
-                    end else begin
-                        burst_cnt_d = burst_cnt_q + 1'b1;
-                        state_d     = S_BP_RD_ISSUE;
-                    end
-                end
-            end
-
-            S_BP_WR_ISSUE: begin
-                // Hold the enable until the controller accepts, same rule
-                // as the writeback path.
-                sdram_wr_en = !sdram_busy;
-                if (sdram_busy) state_d = S_BP_WR_WAIT;
-            end
-
-            S_BP_WR_WAIT: begin
-                if (!sdram_busy) begin
-                    if (bp_last) begin
-                        state_d = S_UNSTALL;
-                    end else begin
-                        burst_cnt_d = burst_cnt_q + 1'b1;
-                        state_d     = S_BP_RD_ISSUE;
-                    end
-                end
+            S_BP_WRITE: begin
+                // Always a single word: only the D port can store, and a D
+                // bypass is one word wide. (The read-modify-write merge is
+                // in bp_wr_data, which eng_cmd_wdata places at word 0.)
+                eng_cmd_valid = eng_cmd_ready;
+                eng_cmd_we    = 1'b1;
+                eng_cmd_words = 4'd1;
+                if (eng_done) state_d = S_UNSTALL;
             end
 
             default: state_d = S_IDLE;
@@ -1620,8 +1631,9 @@ module cache_cntrl #(
     // -------------------------------------------------------------
 
     // Victim line as read back in S_WB_READ: held in the victim way's
-    // rdata_q through S_WB_ISSUE/S_WB_WAIT (lookups are gated, so no other
-    // read can overwrite it).
+    // rdata_q through S_WB_XFER (lookups are gated, so no other read can
+    // overwrite it). This is the engine's write data, and holding it for
+    // the whole transfer is exactly the contract sdram_line_port states.
     assign fsm_victim_line = (req_sel_q == 1'b0) ? imem_rsp_d[fsm_victim_way].rdata :
         dmem_rsp_d[fsm_victim_way].rdata;
 
@@ -1632,7 +1644,7 @@ module cache_cntrl #(
     assign miss_is_store = req_sel_q && dskid_q[miss_slot_q].we;
 
     always_comb begin
-        commit_line = line_buf_q;
+        commit_line = eng_rdata;
         if (miss_is_store) begin
             for (int b = 0; b < yarv32_cache_pkg::LSU_STRB_W; b++) begin
                 if (dskid_q[miss_slot_q].wstrb[b]) begin
@@ -1721,13 +1733,14 @@ module cache_cntrl #(
     end
 
     // Lookups on the cache the FSM is servicing are held while the FSM
-    // touches its macros: S_WB_READ..S_WB_WAIT hold the victim line in the
-    // data macro's rdata_q (the writeback streams out of it word by word),
-    // S_UPDATE_TAG commits the line+tag writes. S_REFILL_* leave the macros
-    // alone, so hits resume during the long refill phase.
+    // touches its macros: S_WB_READ and S_WB_XFER hold the victim line in
+    // the data macro's rdata_q (the engine streams its write data straight
+    // off that output), S_UPDATE_TAG commits the line+tag writes.
+    // S_REFILL_XFER leaves the macros alone, so hits resume during the long
+    // refill phase.
     logic fsm_macro_state;
-    assign fsm_macro_state = (state_q == S_WB_READ) || (state_q == S_WB_ISSUE) ||
-        (state_q == S_WB_WAIT) || (state_q == S_UPDATE_TAG);
+    assign fsm_macro_state = (state_q == S_WB_READ) || (state_q == S_WB_XFER) ||
+        (state_q == S_UPDATE_TAG);
     assign fsm_lookup_gate[0] = fsm_macro_state && (req_sel_q == 1'b0);
     assign fsm_lookup_gate[1] = fsm_macro_state && (req_sel_q == 1'b1);
 
@@ -1739,13 +1752,13 @@ module cache_cntrl #(
     assign fsm_unstall[1] = (state_q == S_UNSTALL) && (req_sel_q == 1'b1);
     assign fsm_rsp_push[0] = fsm_unstall[0];
     assign fsm_rsp_push[1] = fsm_unstall[1] && !dskid_q[miss_slot_q].we;
-    // A refill answers out of the line it just assembled; a bypass answers
-    // with the word(s) it fetched, which sit at the bottom of the same
-    // buffer.
-    assign fsm_rsp_data_i = byp_q ? line_buf_q[yarv32_cache_pkg::IFETCH_DATA_W-1:0] :
-        line_buf_q[miss_addr_q[NBIT_OFFSET-1:3]*64+:64];
-    assign fsm_rsp_data_d = byp_q ? line_buf_q[yarv32_cache_pkg::LSU_DATA_W-1:0] :
-        line_buf_q[miss_addr_q[NBIT_OFFSET-1:2]*32+:32];
+    // A refill answers out of the line the engine just assembled; a bypass
+    // answers with the word(s) it fetched, which sit at the bottom of that
+    // same buffer.
+    assign fsm_rsp_data_i = byp_q ? eng_rdata[yarv32_cache_pkg::IFETCH_DATA_W-1:0] :
+        eng_rdata[miss_addr_q[NBIT_OFFSET-1:3]*64+:64];
+    assign fsm_rsp_data_d = byp_q ? eng_rdata[yarv32_cache_pkg::LSU_DATA_W-1:0] :
+        eng_rdata[miss_addr_q[NBIT_OFFSET-1:2]*32+:32];
 
     // -------------------------------------------------------------
     // D-cache store hit (posted). The data-macro write into the hit way and
